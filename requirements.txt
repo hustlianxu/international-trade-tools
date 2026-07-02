@@ -1,0 +1,25 @@
+# 微信解析
+pycryptodome>=3.20.0          # AES-CBC/ECB 解密
+zstandard>=0.22.0             # 微信4.x 消息内容 ZSTD 解压
+pymem>=1.13                   # Windows 进程内存读取（4.0.x 密钥扫描）
+psutil>=5.9                   # 进程查找
+pilk>=1.7                     # SILK v3 → PCM 语音解码（微信格式）
+
+# 语音识别 - 本地（Mac M3 优先）
+mlx-whisper>=0.4.1            # Apple Silicon 优化的 Whisper（M3 首选）
+# faster-whisper>=1.0.3       # Windows/Linux GPU 优化（备选）
+
+# 语音识别 - 云端（跨平台备选）
+requests>=2.31                # HTTP 调用火山豆包/OpenAI API
+
+# 大模型
+openai>=1.40                  # DeepSeek 兼容 OpenAI SDK
+
+# 存储与工具
+pyyaml>=6.0                   # 配置文件
+sqlite-utils>=3.36            # 游标与结构化存储
+python-dateutil>=2.8          # 时间处理
+
+# 监控与调度
+watchdog>=3.0                 # 文件变化监听（备选 WAL mtime 轮询）
+apscheduler>=3.10             # 定时提醒调度（按天/小时推进）

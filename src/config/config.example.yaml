@@ -1,0 +1,89 @@
+# 外贸助手配置示例
+# 复制为 config.yaml 后填入真实值
+
+# ═══════ 微信解析配置 ═══════
+wechat:
+  # 微信版本：4.0.x 用内存扫描，4.1.x 需 DLL 注入（见 docs/03）
+  version: "4.0.x"
+
+  # Windows: C:\Users\<用户名>\Documents\xwechat_files\<wxid>_<hash>\db_storage\
+  # Mac:     ~/Library/Containers/com.tencent.xinWeChat/Data/...
+  db_storage_path: ""
+
+  # 微信进程名（用于内存扫描获取密钥）
+  # Windows: WeChat.exe | Mac: 微信 | Linux: wechat
+  process_name: "WeChat.exe"
+
+  # 准实时监听开关
+  realtime_enabled: true
+  # WAL 文件 mtime 轮询间隔（毫秒），30~200ms 平衡延迟与 CPU
+  poll_interval_ms: 100
+  # 检测到变化后的 debounce（毫秒），避免高频写入风暴
+  debounce_ms: 200
+
+  # 只监听这些会话（wxid 或群ID），为空则监听全部
+  watch_talkers: []
+  # 忽略这些会话（如文件传输助手、系统通知）
+  ignore_talkers:
+    - "filehelper"
+    - "weixin"
+
+# ═══════ 语音识别（ASR）配置 ═══════
+asr:
+  # 引擎选择：mlx_whisper（Mac M3 本地）/ volcengine（火山豆包云端）/ openai
+  # M3 推荐 mlx_whisper（0元），Windows 低配机推荐 volcengine（~7元/月）
+  engine: "mlx_whisper"
+
+  # 本地 MLX Whisper 配置
+  mlx_whisper:
+    # 模型：medium（推荐，西语WER 4-6%，M3约7秒/分钟音频）
+    #       large-v3（最高精度，M3接近实时）
+    #       small（速度优先，WER 6-9%）
+    model: "mlx-community/whisper-medium-mlx-8bit"
+    # 语言：留空自动检测（推荐，外贸中西汉混用）
+    #       或固定 "es" / "zh"
+    language: ""
+    # 初始 prompt（注入热词，提升产品名/行业术语识别率）
+    initial_prompt: "外贸业务，询价，报价，订单，发货，物流，提单，信用证，LC，FOB，CIF，客户"
+
+  # 火山引擎豆包 ASR 2.0 配置（跨平台云端，0.0133元/分钟）
+  volcengine:
+    app_id: ""
+    access_token: ""
+    # Seed-ASR 多语种模型，西语+中文原生支持
+    model: "bigmodel"
+
+  # OpenAI gpt-4o-mini-transcribe（最高准确率，0.0216元/分钟）
+  openai:
+    api_key: ""
+    model: "gpt-4o-mini-transcribe"
+
+# ═══════ 大模型需求分析配置 ═══════
+llm:
+  # DeepSeek V4-Flash：输入1元/百万tokens，输出2元/百万，月费<1元
+  provider: "deepseek"
+  deepseek:
+    api_key: ""          # 填入你的 DeepSeek API Key
+    base_url: "https://api.deepseek.com"
+    model: "deepseek-chat"
+    temperature: 0.3     # 业务理解需稳定，偏低
+    max_tokens: 2000
+
+# ═══════ TODO 提醒配置 ═══════
+reminder:
+  # 提醒粒度：daily（每天）/ hourly（每小时）
+  granularity: "daily"
+  # 每日提醒时间（24h制）
+  daily_time: "09:00"
+  # 每小时提醒的分钟（如 ":00" 整点）
+  hourly_minute: 0
+  # 提醒渠道：console（终端）/ wechat_file（写入文件供查看）
+  channels:
+    - "console"
+  # 待办超期天数（超期标红）
+  overdue_days: 3
+
+# ═══════ 存储配置 ═══════
+storage:
+  # 本地 SQLite，存游标、转写结果、TODO
+  db_path: "./data/trade_tools.db"

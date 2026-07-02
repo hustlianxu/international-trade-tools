@@ -1,0 +1,24 @@
+# 敏感配置
+src/config/config.yaml
+data/
+tmp/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# 微信数据（绝不提交）
+*.db
+*.db-wal
+*.silk
+*.dat
