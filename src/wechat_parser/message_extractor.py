@@ -4,6 +4,10 @@
 - 30~100ms 轮询 WAL 文件 mtime（不能用 size，WAL 预分配 4MB 固定大小）
 - 检测到变化后 debounce → 增量解密 → 按 msg_svr_id 游标提取新消息
 - 端到端延迟约 100ms
+
+支持两种密钥模式：
+1. 单密钥（旧版兼容）：传入 WeChatDecryptor 实例
+2. 多密钥（推荐）：传入 WeChatKeyStore，按 .db 自动选密钥
 """
 import logging
 import sqlite3
@@ -11,11 +15,11 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 import zstandard
 
-from .decryptor import WeChatDecryptor
+from .decryptor import WeChatDecryptor, WeChatKeyStore
 
 logger = logging.getLogger(__name__)
 
@@ -51,13 +55,59 @@ class ParseCursor:
 
 
 class MessageExtractor:
-    """从解密后的微信消息库提取消息。"""
+    """从解密后的微信消息库提取消息。
+
+    支持两种构造方式：
+    - 单密钥模式：MessageExtractor(decryptor, db_storage_path)
+        decryptor 已绑定某个 key+salt（旧版兼容，仅能解密对应 .db）
+    - 多密钥模式：MessageExtractor.from_key_store(key_store, db_storage_path)
+        每个 .db 自动从 KeyStore 选密钥（推荐，与 wechat-decrypt 一致）
+    """
 
     def __init__(self, decryptor: WeChatDecryptor, db_storage_path: str | Path):
-        self.decryptor = decryptor
+        self._single_decryptor = decryptor
+        self._key_store: Optional[WeChatKeyStore] = None
         self.db_storage_path = Path(db_storage_path)
         self._zstd_decompressor = zstandard.ZstdDecompressor()
         self._msg_db_cache: dict[str, sqlite3.Connection] = {}
+        self._decryptor_cache: dict[str, WeChatDecryptor] = {}
+
+    @classmethod
+    def from_key_store(cls, key_store: WeChatKeyStore, db_storage_path: str | Path) -> "MessageExtractor":
+        """从 KeyStore 创建（推荐：每个 .db 自动选密钥）。"""
+        inst = cls.__new__(cls)
+        inst._single_decryptor = None
+        inst._key_store = key_store
+        inst.db_storage_path = Path(db_storage_path)
+        inst._zstd_decompressor = zstandard.ZstdDecompressor()
+        inst._msg_db_cache = {}
+        inst._decryptor_cache = {}
+        return inst
+
+    @property
+    def decryptor(self) -> WeChatDecryptor:
+        """兼容旧代码：返回单密钥 decryptor（若未设置则报错）。"""
+        if self._single_decryptor is None:
+            raise RuntimeError(
+                "当前为多密钥模式，无法返回单一 decryptor。"
+                "请用 _get_decryptor_for_db(db_path) 获取指定 .db 的解密器。"
+            )
+        return self._single_decryptor
+
+    def _get_decryptor_for_db(self, db_path: str | Path) -> WeChatDecryptor:
+        """获取指定 .db 的解密器（自动从 KeyStore 选密钥）。"""
+        db_path = Path(db_path)
+        cache_key = str(db_path)
+        if cache_key in self._decryptor_cache:
+            return self._decryptor_cache[cache_key]
+        if self._key_store is not None:
+            dec = WeChatDecryptor.for_db(self._key_store, db_path)
+        elif self._single_decryptor is not None:
+            dec = self._single_decryptor
+        else:
+            raise RuntimeError("既无 KeyStore 也无单密钥 decryptor")
+        self._decryptor_cache[cache_key] = dec
+        return dec
 
     def _get_msg_db_connection(self, talker_id: str) -> sqlite3.Connection:
         """根据 talker_id 定位 message_*.db 并返回连接。
@@ -65,17 +115,18 @@ class MessageExtractor:
         微信 4.x 有 message_0~13.db 共 14 个库，每个库含多个 Msg_<hash> 表。
         talker_id → 表名的映射存在 Name2Id 表。
         """
-        # 简化实现：遍历所有 message_*.db 查找含该 talker 表的库
-        # 实际应用中可缓存 talker_id → db 的映射
         cache_key = talker_id
         if cache_key in self._msg_db_cache:
             return self._msg_db_cache[cache_key]
 
         msg_dir = self.db_storage_path / "message"
+        if not msg_dir.exists():
+            raise FileNotFoundError(f"消息目录不存在: {msg_dir}")
+
         for db_file in sorted(msg_dir.glob("message_*.db")):
-            plain_path = self.decryptor.decrypt_db(db_file)
+            dec = self._get_decryptor_for_db(db_file)
+            plain_path = dec.decrypt_db(db_file)
             conn = sqlite3.connect(f"file:{plain_path}?mode=ro", uri=True)
-            # 查 Name2Id 表确认该 talker 是否在此库
             try:
                 cur = conn.execute(
                     "SELECT table_name FROM Name2Id WHERE user_name = ?", (talker_id,)
@@ -233,12 +284,11 @@ class MessageExtractor:
     def list_all_talkers(self) -> list[str]:
         """列出所有会话 talker ID（从 session.db）。"""
         try:
-            session_db = self.db_storage_path / "session" / "session.db"
-            if not session_db.exists():
-                session_db = self.db_storage_path / "session.db"
-            if not session_db.exists():
+            session_db = self._find_session_db()
+            if session_db is None:
                 return []
-            plain_path = self.decryptor.decrypt_db(session_db)
+            dec = self._get_decryptor_for_db(session_db)
+            plain_path = dec.decrypt_db(session_db)
             conn = sqlite3.connect(f"file:{plain_path}?mode=ro", uri=True)
             cur = conn.execute("SELECT DISTINCT user_name FROM session ORDER BY update_time DESC LIMIT 200")
             talkers = [r[0] for r in cur.fetchall()]
@@ -256,12 +306,11 @@ class MessageExtractor:
         """
         contacts = []
         try:
-            session_db = self.db_storage_path / "session" / "session.db"
-            if not session_db.exists():
-                session_db = self.db_storage_path / "session.db"
-            if not session_db.exists():
+            session_db = self._find_session_db()
+            if session_db is None:
                 return contacts
-            plain_path = self.decryptor.decrypt_db(session_db)
+            dec = self._get_decryptor_for_db(session_db)
+            plain_path = dec.decrypt_db(session_db)
             conn = sqlite3.connect(f"file:{plain_path}?mode=ro", uri=True)
             # session 表字段: user_name, nickname, update_time, ...
             cur = conn.execute(
@@ -282,6 +331,16 @@ class MessageExtractor:
         except Exception as e:
             logger.debug("列出联系人失败: %s", e)
         return contacts
+
+    def _find_session_db(self) -> Optional[Path]:
+        """查找 session.db（兼容 db_storage/session/session.db 和 db_storage/session.db）。"""
+        for candidate in (
+            self.db_storage_path / "session" / "session.db",
+            self.db_storage_path / "session.db",
+        ):
+            if candidate.exists():
+                return candidate
+        return None
 
 
 class RealtimeMonitor:
@@ -377,8 +436,11 @@ class RealtimeMonitor:
     def _get_recent_talkers(self) -> list[str]:
         """从 session.db 获取最近活跃会话列表。"""
         try:
-            session_db = self.db_storage_path / "session" / "session.db"
-            plain_path = self.extractor.decryptor.decrypt_db(session_db)
+            session_db = self.extractor._find_session_db()
+            if session_db is None:
+                return []
+            dec = self.extractor._get_decryptor_for_db(session_db)
+            plain_path = dec.decrypt_db(session_db)
             conn = sqlite3.connect(f"file:{plain_path}?mode=ro", uri=True)
             cur = conn.execute("SELECT DISTINCT user_name FROM session ORDER BY update_time DESC LIMIT 50")
             talkers = [r[0] for r in cur.fetchall()]

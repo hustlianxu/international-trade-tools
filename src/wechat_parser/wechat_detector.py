@@ -215,9 +215,7 @@ def list_contacts_from_db(db_storage_path: str) -> list[dict]:
     Returns:
         [{"talker": wxid, "name": 昵称, "type": "user"/"group", "last_time": ts}, ...]
     """
-    from .decryptor import WeChatDecryptor
-    from .message_extractor import MessageExtractor
-
+    # session.db 加密，密钥由调用方通过 get_key_store() / MessageExtractor 管理
     contacts = []
     try:
         # 先尝试从 session.db 获取会话列表

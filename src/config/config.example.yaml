@@ -14,6 +14,20 @@ wechat:
   # Windows: WeChat.exe | Mac: 微信 | Linux: wechat
   process_name: "WeChat.exe"
 
+  # ──────── 密钥获取（三选一，按优先级回退） ────────
+  # 1) 批量密钥文件（推荐）：由 wechat-decrypt 工具导出的 all_keys.json
+  #    路径指向该文件后，每个 .db 会按 salt 自动匹配密钥，无需提权扫描。
+  all_keys_json_path: ""
+
+  # 2) 手动输入单个 96 字符 hex 密钥（enc_key 64hex + salt 32hex）
+  #    可用 wechat-decrypt / lldb / 内存扫描工具获取。
+  raw_key: ""
+
+  # 3) 自动内存扫描（需对应平台权限）
+  #    Mac: 需 sudo 运行，或 GUI 中勾选「弹窗提权」(osascript 输入 root 密码)
+  #    Windows: 需管理员权限运行
+  auto_scan: true
+
   # 准实时监听开关
   realtime_enabled: true
   # WAL 文件 mtime 轮询间隔（毫秒），30~200ms 平衡延迟与 CPU

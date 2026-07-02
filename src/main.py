@@ -108,7 +108,7 @@ def run_realtime(config):
     from src.llm.deepseek_analyzer import DeepSeekAnalyzer
     from src.reminder.todo_manager import TodoManager
     from src.storage.store import Store
-    from src.wechat_parser.decryptor import WeChatDecryptor, scan_wechat_key
+    from src.wechat_parser.decryptor import get_key_store
     from src.wechat_parser.message_extractor import MessageExtractor, RealtimeMonitor
 
     wechat_cfg = config["wechat"]
@@ -120,14 +120,20 @@ def run_realtime(config):
     logger.info("=== 外贸助手 - 准实时模式 ===")
     logger.info("ASR 引擎: %s | LLM: DeepSeek", asr_engine.name())
 
-    # 1. 获取微信密钥
-    logger.info("正在扫描微信密钥...")
-    raw_key = scan_wechat_key(wechat_cfg["process_name"])
-    decryptor = WeChatDecryptor.from_raw_key_hex(raw_key, wechat_cfg["db_storage_path"])
-    logger.info("密钥获取成功")
+    # 1. 获取微信密钥存储（按优先级：all_keys.json → 手动 raw_key → 自动扫描）
+    #    CLI 模式不弹窗提权，需已 sudo 运行或预先加载 all_keys.json
+    logger.info("正在加载微信密钥...")
+    key_store = get_key_store(
+        db_storage_path=wechat_cfg["db_storage_path"],
+        manual_raw_key=wechat_cfg.get("raw_key", ""),
+        all_keys_json_path=wechat_cfg.get("all_keys_json_path", ""),
+        auto_scan=wechat_cfg.get("auto_scan", True),
+        use_sudo_dialog=False,
+    )
+    logger.info("密钥加载成功：%s", key_store.stats())
 
-    # 2. 创建消息提取器
-    extractor = MessageExtractor(decryptor, wechat_cfg["db_storage_path"])
+    # 2. 创建消息提取器（多密钥模式，每个 .db 自动选密钥）
+    extractor = MessageExtractor.from_key_store(key_store, wechat_cfg["db_storage_path"])
 
     # 3. 启动准实时监听
     def on_new(talker, messages):

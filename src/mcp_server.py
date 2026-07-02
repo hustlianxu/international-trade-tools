@@ -304,7 +304,7 @@ class MCPServer:
     def __init__(self, config: dict):
         self.config = config or {}
         # 运行时组件（懒加载，避免微信未配置时启动崩溃）
-        self._decryptor = None
+        self._key_store = None       # WeChatKeyStore（多密钥）
         self._extractor = None
         self._asr_engine = None
         self._analyzer = None
@@ -328,21 +328,24 @@ class MCPServer:
         return self._store
 
     def _init_wechat(self) -> bool:
-        """初始化微信解密器与消息提取器。成功返回 True，失败记录原因返回 False。"""
-        if self._decryptor is not None:
+        """初始化微信密钥存储与消息提取器。成功返回 True，失败记录原因返回 False。
+
+        密钥来源（按优先级）：
+        1. all_keys.json（wechat.all_keys_json_path 配置）
+        2. 手动 raw_key（wechat.raw_key，96 hex）
+        3. 自动扫描（MCP 模式不弹窗提权，需已 sudo 运行）
+        """
+        if self._key_store is not None:
             return True
         if self._wechat_error:
             return False
         with self._init_lock:
-            if self._decryptor is not None:
+            if self._key_store is not None:
                 return True
             if self._wechat_error:
                 return False
             try:
-                from src.wechat_parser.decryptor import (
-                    WeChatDecryptor,
-                    scan_wechat_key,
-                )
+                from src.wechat_parser.decryptor import get_key_store
                 from src.wechat_parser.message_extractor import MessageExtractor
 
                 wechat_cfg = self.config.get("wechat", {})
@@ -359,26 +362,23 @@ class MCPServer:
                     )
                     return False
 
-                # 优先使用配置中的 raw_key（96 字符 hex），否则扫描微信进程
-                raw_key = wechat_cfg.get("raw_key", "")
-                if not raw_key or len(raw_key) != 96:
-                    try:
-                        raw_key = scan_wechat_key(
-                            wechat_cfg.get("process_name", "WeChat.exe")
-                        )
-                    except Exception as e:
-                        self._wechat_error = (
-                            f"扫描微信密钥失败: {e}\n"
-                            "可在 config.yaml 的 wechat.raw_key 手动填入 96 字符 hex 密钥。"
-                        )
-                        return False
-
-                self._decryptor = WeChatDecryptor.from_raw_key_hex(raw_key, db_path)
-                self._extractor = MessageExtractor(self._decryptor, db_path)
-                logger.info("[MCP] 微信解析组件初始化成功")
+                # MCP 模式默认不弹窗提权（避免阻塞 stdio 通道）
+                # 用户应预先加载 all_keys.json 或在 sudo 下运行
+                self._key_store = get_key_store(
+                    db_storage_path=db_path,
+                    manual_raw_key=wechat_cfg.get("raw_key", ""),
+                    all_keys_json_path=wechat_cfg.get("all_keys_json_path", ""),
+                    auto_scan=wechat_cfg.get("auto_scan", True),
+                    use_sudo_dialog=False,
+                )
+                self._extractor = MessageExtractor.from_key_store(self._key_store, db_path)
+                logger.info("[MCP] 微信解析组件初始化成功：%s", self._key_store.stats())
                 return True
             except Exception as e:
-                self._wechat_error = f"初始化微信解析失败: {e}"
+                self._wechat_error = (
+                    f"初始化微信解析失败: {e}\n"
+                    "可在「设置」中加载 all_keys.json 或手动填入密钥。"
+                )
                 logger.error("[MCP] 微信初始化失败", exc_info=True)
                 return False
 
