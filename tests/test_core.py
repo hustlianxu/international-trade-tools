@@ -24,22 +24,80 @@ class TestSilkDecoder:
         assert is_wechat_silk(b"#!SILK_V3") is False
         assert is_wechat_silk(b"") is False
 
-    def test_normalize_wechat_silk_adds_header_and_footer(self):
+    def test_normalize_wechat_silk_strips_header_adds_footer(self):
+        """微信格式 [0x02][#!SILK_V3][body] → 标准 [#!SILK_V3][body][FF FF]"""
         from src.wechat_parser.silk_decoder import normalize_wechat_silk, SILK_V3_HEADER
-        # 微信格式: 0x02 + 数据
-        wechat_data = b"\x02" + b"\x53\x49\x4c\x4b\x5f\x64\x61\x74\x61"
+        wechat_data = b"\x02" + SILK_V3_HEADER + b"\x53\x49\x4c\x4b\x5f\x64\x61\x74\x61"
         result = normalize_wechat_silk(wechat_data)
-        # 应加标准头和尾
         assert result.startswith(SILK_V3_HEADER)
         assert result.endswith(b"\xFF\xFF")
-        # 0x02 应被去掉
-        assert b"\x02" not in result[:len(SILK_V3_HEADER)]
+        assert not result.startswith(b"\x02")
+        # 关键：不能产生两个 #!SILK_V3 头（旧 bug）
+        assert result.count(SILK_V3_HEADER) == 1
+
+    def test_normalize_wechat_silk_idempotent_on_footer(self):
+        """已有 FF FF 结尾的微信 SILK 不应重复添加。"""
+        from src.wechat_parser.silk_decoder import normalize_wechat_silk, SILK_V3_HEADER
+        wechat_data = b"\x02" + SILK_V3_HEADER + b"body" + b"\xFF\xFF"
+        result = normalize_wechat_silk(wechat_data)
+        assert result.endswith(b"\xFF\xFF")
+        assert result.count(b"\xFF\xFF") == 1
 
     def test_normalize_standard_silk_unchanged(self):
         from src.wechat_parser.silk_decoder import normalize_wechat_silk
         standard = b"#!SILK_V3\x00\x01\x02"
         result = normalize_wechat_silk(standard)
         assert result == standard
+
+    def test_silk_to_wav_roundtrip_with_pysilk(self):
+        """端到端：pysilk encode → 模拟微信格式 → silk_to_wav 解码 → 验证 WAV 可读。"""
+        try:
+            import pysilk
+        except ImportError:
+            print("  (跳过: pysilk-mod 未安装)")
+            return
+
+        import math
+        import struct
+        import tempfile
+        import wave
+        from src.wechat_parser.silk_decoder import silk_to_wav, _get_silk_backend
+
+        # 当前环境必须能用 pysilk 后端（否则测试无意义）
+        backend, _ = _get_silk_backend()
+        if backend != "pysilk":
+            print(f"  (跳过: 当前后端={backend}，非 pysilk)")
+            return
+
+        # 生成 0.5 秒 440Hz 正弦波 PCM
+        sr = 24000
+        n = int(sr * 0.5)
+        pcm = b"".join(
+            struct.pack("<h", int(32767 * 0.3 * math.sin(2 * math.pi * 440 * i / sr)))
+            for i in range(n)
+        )
+        # pysilk.encode 输出即为微信格式 [0x02][#!SILK_V3][body]
+        silk_data = pysilk.encode(pcm, sample_rate=sr)
+        assert silk_data[:1] == b"\x02", "pysilk encode 输出应以 0x02 开头"
+
+        silk_file = tempfile.NamedTemporaryFile(suffix=".silk", delete=False)
+        silk_file.write(silk_data)
+        silk_file.close()
+        wav_file = silk_file.name.replace(".silk", ".wav")
+
+        try:
+            duration = silk_to_wav(silk_file.name, wav_file, sample_rate=sr)
+            assert duration > 0.3, f"时长异常: {duration}"
+            assert os.path.exists(wav_file), "WAV 文件未生成"
+            with wave.open(wav_file, "rb") as w:
+                assert w.getnchannels() == 1
+                assert w.getsampwidth() == 2
+                assert w.getframerate() == sr
+                assert w.getnframes() > 0
+        finally:
+            os.unlink(silk_file.name)
+            if os.path.exists(wav_file):
+                os.unlink(wav_file)
 
 
 # ═══════ 2. 路径管理 ═══════

@@ -19,18 +19,18 @@ datas = [
 hiddenimports = [
     "yaml",
     "zstandard",
-    "pilk",
-    "pymem",
     "psutil",
     "openai",
     "apscheduler",
 ]
+# SILK 后端：Windows 用 pilk，Mac/Linux 用 pysilk-mod
+if sys.platform == "win32":
+    hiddenimports += ["pilk", "pymem"]
+else:
+    hiddenimports += ["pysilk"]
 # Mac 专用
 if sys.platform == "darwin":
     hiddenimports += ["mlx_whisper", "mlx"]
-# Windows 专用
-if sys.platform == "win32":
-    hiddenimports += ["pymem"]
 
 a = Analysis(
     ["src/gui_app.py"],

@@ -1,9 +1,14 @@
 # 微信解析
 pycryptodome>=3.20.0          # AES-CBC/ECB 解密
 zstandard>=0.22.0             # 微信4.x 消息内容 ZSTD 解压
-pymem>=1.13                   # Windows 进程内存读取（4.0.x 密钥扫描）
+pymem>=1.13; sys_platform == "win32"  # Windows 进程内存读取（4.0.x 密钥扫描）
 psutil>=5.9                   # 进程查找
-pilk>=1.7                     # SILK v3 → PCM 语音解码（微信格式）
+
+# SILK 语音解码（两个后端二选一，silk_decoder.py 自动选择）
+# Windows: pilk（自带 x64-win 预编译库）
+# macOS/Linux: pysilk-mod（提供 macosx_arm64 wheel）
+pilk>=0.2.4; sys_platform == "win32"      # Windows 专用
+pysilk-mod>=1.6.4; sys_platform != "win32"  # macOS/Linux 用
 
 # 语音识别 - 本地（仅 Mac M3，Windows 不要装）
 # mlx-whisper>=0.4.1          # Apple Silicon 优化的 Whisper（build_mac.sh 自动安装）
@@ -16,7 +21,6 @@ openai>=1.40                  # DeepSeek 兼容 OpenAI SDK
 
 # 存储与工具
 pyyaml>=6.0                   # 配置文件
-sqlite-utils>=3.36            # 游标与结构化存储
 python-dateutil>=2.8          # 时间处理
 
 # 监控与调度
