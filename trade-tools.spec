@@ -31,6 +31,14 @@ hiddenimports = [
     "psutil",
     "openai",
     "apscheduler",
+    "pysilk",
+    "wave",
+    "json",
+    "hashlib",
+    "hmac",
+    "sqlite3",
+    "struct",
+    "tempfile",
 ]
 # SILK 后端：Windows 用 pilk，Mac/Linux 用 pysilk-mod
 if sys.platform == "win32":

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "trade-tools": {
+      "command": "/path/to/外贸助手.app/Contents/MacOS/TradeTools",
+      "args": ["--mcp"],
+      "env": {}
+    }
+  }
+}

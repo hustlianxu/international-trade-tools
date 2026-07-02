@@ -107,34 +107,47 @@ class MessageExtractor:
             新消息列表（按时间升序）
         """
         conn = self._get_msg_db_connection(talker_id)
-        # 查表名
-        cur = conn.execute(
-            "SELECT table_name FROM Name2Id WHERE user_name = ?", (talker_id,)
-        )
-        row = cur.fetchone()
-        if not row:
+        table_name = self._get_table_name(conn, talker_id)
+        if not table_name:
             return []
-        table_name = row[0]
 
-        # 增量查询：msg_svr_id > 游标
         cur = conn.execute(
             f"SELECT local_id, msg_svr_id, type, is_sender, create_time, "
             f"message_content, message_blob FROM {table_name} "
             f"WHERE msg_svr_id > ? ORDER BY create_time ASC, local_id ASC LIMIT ?",
             (cursor.last_msg_svr_id, limit),
         )
+        messages = self._parse_messages(cur, talker_id)
+
+        if messages:
+            last = messages[-1]
+            cursor.last_msg_svr_id = last.msg_svr_id
+            cursor.last_create_time = last.create_time
+
+        return messages
+
+    def _get_table_name(self, conn: sqlite3.Connection, talker_id: str) -> str:
+        """获取 talker 对应的消息表名。"""
+        try:
+            cur = conn.execute(
+                "SELECT table_name FROM Name2Id WHERE user_name = ?", (talker_id,)
+            )
+            row = cur.fetchone()
+            return row[0] if row else ""
+        except sqlite3.OperationalError:
+            return ""
+
+    def _parse_messages(self, cur, talker_id: str) -> list[WeChatMessage]:
+        """解析查询结果为 WeChatMessage 列表（处理 ZSTD 解压）。"""
         messages = []
         for r in cur.fetchall():
             local_id, msg_svr_id, mtype, is_sender, create_time, content, blob = r
-            # 4.x message_content 是 ZSTD 压缩的，需解压
             content_text = ""
             if content:
                 try:
                     content_text = self._zstd_decompressor.decompress(content).decode("utf-8", errors="replace")
                 except Exception:
-                    # 非 ZSTD 格式（可能是明文），直接解码
                     content_text = content.decode("utf-8", errors="replace")
-
             messages.append(WeChatMessage(
                 local_id=local_id,
                 msg_svr_id=msg_svr_id,
@@ -145,14 +158,130 @@ class MessageExtractor:
                 content_text=content_text,
                 blob_data=blob or b"",
             ))
-
-        # 更新游标
-        if messages:
-            last = messages[-1]
-            cursor.last_msg_svr_id = last.msg_svr_id
-            cursor.last_create_time = last.create_time
-
         return messages
+
+    def extract_messages_by_time(
+        self,
+        talker_id: str,
+        time_from: int = 0,
+        time_to: int = 0,
+        limit: int = 500,
+    ) -> list[WeChatMessage]:
+        """按时间范围提取消息（用于 GUI 时间筛选）。
+
+        Args:
+            talker_id: 会话对方 wxid
+            time_from: 起始 Unix 时间戳（0=不限制）
+            time_to: 结束 Unix 时间戳（0=不限制）
+            limit: 最大返回条数
+
+        Returns:
+            消息列表（按时间升序）
+        """
+        conn = self._get_msg_db_connection(talker_id)
+        table_name = self._get_table_name(conn, talker_id)
+        if not table_name:
+            return []
+
+        sql = f"SELECT local_id, msg_svr_id, type, is_sender, create_time, message_content, message_blob FROM {table_name}"
+        conditions = []
+        params = []
+        if time_from > 0:
+            conditions.append("create_time >= ?")
+            params.append(time_from)
+        if time_to > 0:
+            conditions.append("create_time <= ?")
+            params.append(time_to)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY create_time ASC, local_id ASC LIMIT ?"
+        params.append(limit)
+
+        cur = conn.execute(sql, params)
+        return self._parse_messages(cur, talker_id)
+
+    def search_messages(
+        self,
+        keyword: str,
+        talker_id: str = None,
+        time_from: int = 0,
+        time_to: int = 0,
+        limit: int = 50,
+    ) -> list[WeChatMessage]:
+        """按关键词搜索消息（跨会话）。
+
+        Args:
+            keyword: 搜索关键词
+            talker_id: 限定会话（None=全部）
+            time_from/time_to: 时间范围
+            limit: 最大返回条数
+        """
+        results = []
+        talkers = [talker_id] if talker_id else self.list_all_talkers()
+        for tid in talkers:
+            try:
+                msgs = self.extract_messages_by_time(tid, time_from, time_to, limit=1000)
+                for m in msgs:
+                    if keyword.lower() in m.content_text.lower():
+                        results.append(m)
+                        if len(results) >= limit:
+                            return results
+            except Exception as e:
+                logger.debug("搜索 %s 失败: %s", tid, e)
+        return results
+
+    def list_all_talkers(self) -> list[str]:
+        """列出所有会话 talker ID（从 session.db）。"""
+        try:
+            session_db = self.db_storage_path / "session" / "session.db"
+            if not session_db.exists():
+                session_db = self.db_storage_path / "session.db"
+            if not session_db.exists():
+                return []
+            plain_path = self.decryptor.decrypt_db(session_db)
+            conn = sqlite3.connect(f"file:{plain_path}?mode=ro", uri=True)
+            cur = conn.execute("SELECT DISTINCT user_name FROM session ORDER BY update_time DESC LIMIT 200")
+            talkers = [r[0] for r in cur.fetchall()]
+            conn.close()
+            return talkers
+        except Exception as e:
+            logger.debug("列出会话失败: %s", e)
+            return []
+
+    def list_contacts(self) -> list[dict]:
+        """列出联系人/会话列表（用于左侧栏）。
+
+        Returns:
+            [{"talker": wxid, "name": 昵称, "last_time": ts, "type": "user"/"group"}, ...]
+        """
+        contacts = []
+        try:
+            session_db = self.db_storage_path / "session" / "session.db"
+            if not session_db.exists():
+                session_db = self.db_storage_path / "session.db"
+            if not session_db.exists():
+                return contacts
+            plain_path = self.decryptor.decrypt_db(session_db)
+            conn = sqlite3.connect(f"file:{plain_path}?mode=ro", uri=True)
+            # session 表字段: user_name, nickname, update_time, ...
+            cur = conn.execute(
+                "SELECT user_name, nickname, update_time FROM session "
+                "ORDER BY update_time DESC LIMIT 200"
+            )
+            for row in cur.fetchall():
+                talker, name, last_time = row
+                # 群聊 talker 以 @chatroom 结尾
+                ctype = "group" if talker.endswith("@chatroom") else "user"
+                contacts.append({
+                    "talker": talker,
+                    "name": name or talker,
+                    "last_time": last_time or 0,
+                    "type": ctype,
+                })
+            conn.close()
+        except Exception as e:
+            logger.debug("列出联系人失败: %s", e)
+        return contacts
 
 
 class RealtimeMonitor:

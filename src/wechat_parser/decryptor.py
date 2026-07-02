@@ -138,19 +138,41 @@ class WeChatDecryptor:
         return conn
 
 
-def scan_wechat_key(process_name: str = "WeChat.exe") -> str:
-    """扫描微信进程内存获取 raw key（仅 Windows 4.0.x）。
+def scan_wechat_key(process_name: str = None) -> str:
+    """扫描微信进程内存获取 raw key（跨平台）。
+
+    Windows 4.0.x: 用 pymem 扫描进程内存
+    macOS: 用 lldb 附加微信进程提取密钥（需 sudo）
+    其他/失败: 抛出异常，引导用户手动输入
 
     Returns:
         96 字符 hex 的 raw key（x'<64hex_key><32hex_salt>'）
-
-    ⚠️ 4.1.x 已失效，需用 wx_key DLL 注入。
     """
+    import sys as _sys
+    if _sys.platform == "win32":
+        return _scan_wechat_key_windows(process_name or "WeChat.exe")
+    elif _sys.platform == "darwin":
+        return _scan_wechat_key_macos()
+    else:
+        raise RuntimeError(
+            "当前系统不支持自动扫描微信密钥。\n"
+            "请手动输入密钥（96 字符 hex），获取方式见使用手册。"
+        )
+
+
+def _scan_wechat_key_windows(process_name: str = "WeChat.exe") -> str:
+    """Windows: 用 pymem 扫描微信进程内存（仅 4.0.x）。"""
     try:
         import pymem
+    except ImportError:
+        raise RuntimeError(
+            "pymem 未安装（Windows 专用）。请运行: pip install pymem\n"
+            "或手动输入微信密钥（96 字符 hex）。"
+        )
+    try:
         import psutil
     except ImportError:
-        raise RuntimeError("需安装 pymem 和 psutil: pip install pymem psutil")
+        raise RuntimeError("psutil 未安装。请运行: pip install psutil")
 
     # 查找微信进程
     target_pid = None
@@ -166,7 +188,6 @@ def scan_wechat_key(process_name: str = "WeChat.exe") -> str:
 
     # 扫描内存匹配 x'<96 hex>' 模式
     pm = pymem.Pymem(target_pid)
-    # raw key 格式: b"x'" + 96 hex chars + b"'"
     pattern = b"x'"
     candidates = []
 
@@ -174,7 +195,6 @@ def scan_wechat_key(process_name: str = "WeChat.exe") -> str:
         try:
             base = module.lpBaseOfDll
             size = module.SizeOfImage
-            # 分块读取内存
             CHUNK = 0x100000  # 1MB
             for offset in range(0, size, CHUNK):
                 read_size = min(CHUNK, size - offset)
@@ -182,17 +202,14 @@ def scan_wechat_key(process_name: str = "WeChat.exe") -> str:
                     data = pm.read_bytes(base + offset, read_size)
                 except Exception:
                     continue
-                # 搜索 pattern
                 pos = 0
                 while True:
                     idx = data.find(pattern, pos)
                     if idx == -1:
                         break
-                    # 提取后续 98 字节（96 hex + 1 引号）
                     candidate = data[idx: idx + 99]
                     if len(candidate) == 99 and candidate[98:99] == b"'":
                         hex_str = candidate[2:98]
-                        # 验证是否全为 hex 字符
                         try:
                             bytes.fromhex(hex_str.decode("ascii"))
                             candidates.append(hex_str.decode("ascii"))
@@ -207,9 +224,130 @@ def scan_wechat_key(process_name: str = "WeChat.exe") -> str:
             "未在内存中找到微信密钥。可能原因：\n"
             "1. 微信版本为 4.1.x，内存扫描已失效（需 wx_key DLL 注入）\n"
             "2. 微信刚启动未加载数据库（请先打开几个聊天）\n"
-            "3. 权限不足（需管理员权限运行）"
+            "3. 权限不足（需管理员权限运行）\n"
+            "4. 可手动输入密钥（96 字符 hex）"
         )
 
-    # 返回第一个候选（实际应用中需通过 HMAC 校验筛选正确的）
     logger.info("[密钥扫描] 找到 %d 个候选密钥", len(candidates))
     return candidates[0]
+
+
+def _scan_wechat_key_macos() -> str:
+    """macOS: 尝试用 lldb 附加微信进程提取密钥。
+
+    需要 sudo 权限（lldb 附加进程需要）。
+    若失败，抛出异常引导用户手动输入。
+    """
+    import subprocess
+    import tempfile
+
+    # lldb 脚本：附加微信进程，搜索内存中的密钥模式
+    # 微信 4.x Mac 密钥在内存中以特定模式存在
+    lldb_script = '''
+import lldb
+import re
+
+def find_key(process):
+    """在进程内存中搜索密钥。"""
+    target = process.GetTarget()
+    for module in target.module_iter():
+        for section in module.section_iter():
+            if not section.IsValid():
+                continue
+            data = section.GetSectionData()
+            if not data.IsValid():
+                continue
+            size = data.GetByteSize()
+            if size == 0 or size > 100 * 1024 * 1024:
+                continue
+            buf = bytearray(size)
+            data.ReadRawData(0, buf, size)
+            # 搜索 96 字符 hex 模式（密钥+盐）
+            # 微信 4.x 密钥特征：32 字节密钥后跟 16 字节盐
+            text = buf.decode('latin-1', errors='replace')
+            # 匹配连续 96 个 hex 字符
+            for m in re.finditer(r'[0-9a-fA-F]{96}', text):
+                key_hex = m.group()
+                # 验证：前 64 字符为密钥，后 32 字符为盐
+                try:
+                    bytes.fromhex(key_hex)
+                    print("FOUND_KEY:" + key_hex)
+                    return
+                except Exception:
+                    pass
+
+process = lldb.target.process
+if process and process.IsValid():
+    find_key(process)
+else:
+    print("NO_PROCESS")
+'''
+
+    try:
+        # 查找微信进程
+        result = subprocess.run(
+            ["pgrep", "-x", "微信"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            result = subprocess.run(
+                ["pgrep", "-f", "xinWeChat"],
+                capture_output=True, text=True, timeout=5
+            )
+        if result.returncode != 0 or not result.stdout.strip():
+            raise RuntimeError(
+                "未找到微信进程。请确保微信已登录运行。\n"
+                "若微信正在运行仍报此错，可手动输入密钥。"
+            )
+        pid = result.stdout.strip().split("\n")[0]
+
+        # 用 lldb 附加（需要 sudo）
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write(lldb_script)
+            script_path = f.name
+
+        try:
+            result = subprocess.run(
+                ["lldb", "-p", pid, "-o", f"command script import {script_path}",
+                 "-o", "quit"],
+                capture_output=True, text=True, timeout=30
+            )
+            output = result.stdout + result.stderr
+            # 解析 FOUND_KEY:xxx
+            for line in output.split("\n"):
+                if line.startswith("FOUND_KEY:"):
+                    key = line[len("FOUND_KEY:"):].strip()
+                    logger.info("[密钥扫描] lldb 成功提取密钥")
+                    return key
+            raise RuntimeError(
+                "lldb 未能从内存中提取密钥。\n"
+                "可能原因：\n"
+                "1. 需要 sudo 权限（终端运行: sudo 外贸助手）\n"
+                "2. 微信版本不支持此方法\n"
+                "3. 请手动输入密钥（96 字符 hex）"
+            )
+        finally:
+            Path(script_path).unlink(missing_ok=True)
+    except FileNotFoundError:
+        raise RuntimeError(
+            "未找到 lldb 工具。请安装 Xcode Command Line Tools:\n"
+            "  xcode-select --install\n"
+            "或手动输入密钥（96 字符 hex）"
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("lldb 附加超时，请手动输入密钥")
+
+
+def get_wechat_key_with_fallback(process_name: str = None, manual_key: str = None) -> str:
+    """获取微信密钥，支持手动输入回退。
+
+    优先自动扫描，失败时若提供了 manual_key 则使用手动值。
+    """
+    if manual_key and len(manual_key.strip()) == 96:
+        return manual_key.strip()
+    try:
+        return scan_wechat_key(process_name)
+    except RuntimeError as e:
+        if manual_key and len(manual_key.strip()) == 96:
+            return manual_key.strip()
+        raise

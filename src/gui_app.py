@@ -1,12 +1,18 @@
-"""外贸助手 GUI 主应用（Tkinter）。
+"""外贸助手 GUI 主应用 - 仿微信三栏界面。
 
-跨平台桌面界面，支持 Windows / macOS / Linux。
-启动后自动创建配置目录，首次使用在「配置」页填入 API Key 即可。
+布局：
+  左栏：联系人/群聊列表（可搜索）
+  中栏：聊天内容（时间筛选 + 语音自动转录 + 气泡展示）
+  右栏：AI 分析结果（总结/需求/待办，支持查看/保存/导出）
+
+底部状态栏：微信连接状态 + ASR 引擎。
 
 用法:
     python src/gui_app.py          # 开发模式
+    python src/gui_app.py --mcp    # MCP server 模式
     打包后双击运行                    # 开箱即用
 """
+import json
 import logging
 import os
 import queue
@@ -14,18 +20,18 @@ import sys
 import threading
 import time
 import tkinter as tk
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import yaml
 
+from src.theme import Colors, Fonts, apply_theme, create_bubble_text
 
-# ═══════ 启动诊断：GUI 模式下重定向 stdout/stderr 到日志文件 ═══════
-# PyInstaller 打包后 console=False，stdout/stderr 可能丢失，导致闪退时无错误信息
-# 仅在打包模式（frozen）下重定向，开发模式保持 stdout 输出到终端
+
+# ═══════ 启动诊断：打包模式下重定向日志 ═══════
 def _setup_logging_redirect():
-    """把 stdout/stderr 重定向到用户目录的日志文件，方便诊断闪退。"""
+    """打包模式下把 stdout/stderr 重定向到日志文件，方便诊断闪退。"""
     is_frozen = getattr(sys, "frozen", False)
     if is_frozen:
         try:
@@ -43,21 +49,14 @@ def _setup_logging_redirect():
             f.write(f"\n{'='*60}\n外贸助手启动 @ {datetime.now().isoformat()}\n{'='*60}\n")
             sys.stdout = f
             sys.stderr = f
-            logging.basicConfig(
-                level=logging.INFO,
+            logging.basicConfig(level=logging.INFO,
                 format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-                datefmt="%H:%M:%S",
-                stream=f,
-            )
+                datefmt="%H:%M:%S", stream=f)
             return log_file
         except Exception:
             pass
-    # 开发模式：正常输出到终端
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    logging.basicConfig(level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s", datefmt="%H:%M:%S")
     return None
 
 
@@ -68,47 +67,65 @@ from src.paths import ensure_default_config, get_app_dir, get_config_path, get_d
 logger = logging.getLogger("trade-tools-gui")
 
 
+def _is_mlx_whisper_available() -> bool:
+    try:
+        import mlx_whisper  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _write_crash_log(exc: Exception) -> Path | None:
+    import traceback
+    try:
+        crash_log = get_app_dir() / "crash.log"
+        crash_log.write_text(
+            f"外贸助手崩溃 @ {datetime.now().isoformat()}\nPython: {sys.version}\n"
+            f"Platform: {sys.platform}\n{'='*60}\n{traceback.format_exc()}",
+            encoding="utf-8")
+        return crash_log
+    except Exception:
+        return None
+
+
 class TradeToolsApp:
-    """外贸助手主窗口。"""
+    """外贸助手主窗口 - 仿微信三栏布局。"""
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("外贸助手 - 微信 AI 客户管理工具")
-        self.root.geometry("900x640")
-        self.root.minsize(800, 560)
+        self.root.title("外贸助手 - 微信 AI 客户管理")
+        self.root.geometry("1200x750")
+        self.root.minsize(1000, 650)
 
-        # 配置文件
+        # 配置
         self.config_path = get_config_path()
         ensure_default_config()
         self.config = self._load_config()
 
-        # 后台监听线程相关
-        self.monitor_thread = None
-        self.monitor_stop_event = threading.Event()
-        self.message_queue: queue.Queue = queue.Queue()
-        self.is_monitoring = False
+        # 线程安全队列
+        self.task_queue: queue.Queue = queue.Queue()
 
         # 运行时组件（懒加载）
-        self._store = None
+        self._decryptor = None
+        self._extractor = None
         self._asr_engine = None
         self._analyzer = None
         self._todo_mgr = None
+        self._store = None
+        self._contacts_cache = []
+        self._current_talker = None
+        self._current_messages = []
 
         # 构建 UI
         self._build_ui()
-
-        # 启动队列轮询
+        self._auto_detect_wechat()
         self._poll_queue()
 
-    # ═══════ 配置加载 ═══════
+    # ═══════ 配置 ═══════
     def _load_config(self) -> dict:
         try:
             with open(self.config_path, encoding="utf-8") as f:
-                cfg = yaml.safe_load(f) or {}
-            # 确保 db_path 指向用户目录
-            if not cfg.get("storage", {}).get("db_path"):
-                cfg.setdefault("storage", {})["db_path"] = str(get_db_path())
-            return cfg
+                return yaml.safe_load(f) or {}
         except Exception as e:
             logger.error("加载配置失败: %s", e)
             return {}
@@ -116,12 +133,58 @@ class TradeToolsApp:
     def _save_config(self):
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:
-                yaml.safe_dump(self.config, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
-            logger.info("配置已保存: %s", self.config_path)
+                yaml.safe_dump(self.config, f, allow_unicode=True,
+                    default_flow_style=False, sort_keys=False)
         except Exception as e:
             logger.error("保存配置失败: %s", e)
 
+    # ═══════ 自动检测微信 ═══════
+    def _auto_detect_wechat(self):
+        """启动时自动检测微信路径和进程。"""
+        from src.wechat_parser.wechat_detector import detect_wechat
+
+        def _detect():
+            try:
+                detection = detect_wechat()
+                self.task_queue.put(("detect_done", detection))
+            except Exception as e:
+                self.task_queue.put(("detect_error", str(e)))
+
+        threading.Thread(target=_detect, daemon=True).start()
+
+    def _on_detect_done(self, detection):
+        """检测结果回调（主线程）。"""
+        wechat_cfg = self.config.setdefault("wechat", {})
+        if detection.found:
+            wechat_cfg["db_storage_path"] = detection.db_storage_path
+            wechat_cfg["process_name"] = detection.process_name
+            self._save_config()
+            self._set_status(f"微信已检测: {detection.wxid or '未知'} | 进程: {'运行中' if detection.process_running else '未运行'}")
+            logger.info("自动检测到微信: %s", detection.db_storage_path)
+        else:
+            self._set_status("未检测到微信，请点击「设置」手动配置")
+        # 更新设置页的路径显示
+        if hasattr(self, "cfg_wechat_path"):
+            self.cfg_wechat_path.set(wechat_cfg.get("db_storage_path", ""))
+        if hasattr(self, "cfg_process_name"):
+            self.cfg_process_name.set(wechat_cfg.get("process_name", ""))
+
     # ═══════ 懒加载运行时组件 ═══════
+    def _get_decryptor(self):
+        if self._decryptor is None:
+            from src.wechat_parser.decryptor import WeChatDecryptor, get_wechat_key_with_fallback
+            wechat_cfg = self.config["wechat"]
+            manual_key = wechat_cfg.get("raw_key", "")
+            raw_key = get_wechat_key_with_fallback(wechat_cfg.get("process_name"), manual_key)
+            self._decryptor = WeChatDecryptor.from_raw_key_hex(raw_key, wechat_cfg["db_storage_path"])
+        return self._decryptor
+
+    def _get_extractor(self):
+        if self._extractor is None:
+            from src.wechat_parser.message_extractor import MessageExtractor
+            self._extractor = MessageExtractor(self._get_decryptor(), self.config["wechat"]["db_storage_path"])
+        return self._extractor
+
     def _get_store(self):
         if self._store is None:
             from src.storage.store import Store
@@ -147,553 +210,824 @@ class TradeToolsApp:
             self._todo_mgr = TodoManager(self._get_store())
         return self._todo_mgr
 
-    def _reset_runtimes(self):
-        """配置变更后重置运行时组件（下次使用时重新创建）。"""
-        self._store = None
-        self._asr_engine = None
-        self._analyzer = None
-        self._todo_mgr = None
-
     # ═══════ UI 构建 ═══════
     def _build_ui(self):
-        # 顶部状态栏
-        top_frame = ttk.Frame(self.root, padding=(10, 5))
-        top_frame.pack(fill=tk.X)
-        ttk.Label(top_frame, text="外贸助手", font=("", 14, "bold")).pack(side=tk.LEFT)
-        self.status_label = ttk.Label(top_frame, text="状态: 已停止", foreground="gray")
-        self.status_label.pack(side=tk.RIGHT)
-        self.engine_label = ttk.Label(
-            top_frame,
+        apply_theme(self.root)
+
+        # 顶部标题栏
+        self._build_topbar()
+
+        # 主体三栏
+        body = ttk.Frame(self.root, style="Window.TFrame")
+        body.pack(fill=tk.BOTH, expand=True)
+
+        # 左栏：联系人列表
+        self.left_panel = ttk.Frame(body, style="Panel.TFrame", width=280)
+        self.left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 1))
+        self.left_panel.pack_propagate(False)
+        self._build_contact_panel(self.left_panel)
+
+        # 中栏：聊天内容
+        self.mid_panel = ttk.Frame(body, style="Panel.TFrame")
+        self.mid_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 1))
+        self._build_chat_panel(self.mid_panel)
+
+        # 右栏：分析结果
+        self.right_panel = ttk.Frame(body, style="Panel.TFrame", width=340)
+        self.right_panel.pack(side=tk.LEFT, fill=tk.Y)
+        self.right_panel.pack_propagate(False)
+        self._build_analysis_panel(self.right_panel)
+
+        # 底部状态栏
+        self._build_statusbar()
+
+    def _build_topbar(self):
+        top = ttk.Frame(self.root, style="Panel.TFrame")
+        top.pack(fill=tk.X)
+        ttk.Label(top, text="外贸助手", style="Title.TLabel", padding=(15, 8)).pack(side=tk.LEFT)
+        ttk.Label(top, text="微信 AI 客户管理", style="Muted.TLabel", padding=(0, 0, 15, 0)).pack(side=tk.LEFT)
+
+        btn_frame = ttk.Frame(top, style="Panel.TFrame")
+        btn_frame.pack(side=tk.RIGHT, padx=10)
+        ttk.Button(btn_frame, text="设置", command=self._show_settings).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="待办", command=self._show_todos).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="MCP", command=self._show_mcp_info).pack(side=tk.LEFT, padx=2)
+
+    def _build_statusbar(self):
+        bar = ttk.Frame(self.root, style="Panel.TFrame")
+        bar.pack(fill=tk.X, side=tk.BOTTOM)
+        ttk.Separator(bar, orient=tk.HORIZONTAL).pack(fill=tk.X)
+        self.status_label = ttk.Label(bar, text="正在检测微信...", style="Muted.TLabel", padding=(15, 4))
+        self.status_label.pack(side=tk.LEFT)
+        self.engine_label = ttk.Label(bar,
             text=f"ASR: {self.config.get('asr', {}).get('engine', '未配置')}",
-            foreground="gray",
+            style="Muted.TLabel", padding=(15, 4))
+        self.engine_label.pack(side=tk.RIGHT)
+
+    def _set_status(self, text: str):
+        self.status_label.config(text=text)
+
+    # ─── 左栏：联系人 ───
+    def _build_contact_panel(self, parent):
+        # 搜索框
+        search_frame = ttk.Frame(parent, style="Panel.TFrame")
+        search_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self._filter_contacts())
+        ttk.Entry(search_frame, textvariable=self.search_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(search_frame, text="刷新", width=6, command=self._load_contacts).pack(side=tk.RIGHT, padx=(5, 0))
+
+        ttk.Label(parent, text="联系人 / 群聊", style="Heading.TLabel", padding=(10, 5)).pack(fill=tk.X, anchor=tk.W)
+
+        # 联系人列表
+        list_frame = ttk.Frame(parent, style="Panel.TFrame")
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.contact_tree = ttk.Treeview(list_frame, columns=("talker", "type"),
+            show="tree", selectmode="browse")
+        self.contact_tree.heading("#0", text="名称")
+        self.contact_tree.column("#0", width=200)
+        self.contact_tree.column("talker", width=0, stretch=False)
+        self.contact_tree.column("type", width=0, stretch=False)
+        cscroll = ttk.Scrollbar(list_frame, command=self.contact_tree.yview)
+        self.contact_tree.configure(yscrollcommand=cscroll.set)
+        self.contact_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        cscroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.contact_tree.bind("<<TreeviewSelect>>", self._on_contact_select)
+
+    def _load_contacts(self):
+        """加载联系人列表（后台线程）。"""
+        def _work():
+            try:
+                extractor = self._get_extractor()
+                contacts = extractor.list_contacts()
+                self.task_queue.put(("contacts_loaded", contacts))
+            except Exception as e:
+                self.task_queue.put(("contacts_error", str(e)))
+
+        self._set_status("正在加载联系人...")
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _on_contacts_loaded(self, contacts):
+        self._contacts_cache = contacts
+        self.contact_tree.delete(*self.contact_tree.get_children())
+        for c in contacts:
+            name = c.get("name", c["talker"])
+            icon = "👥" if c.get("type") == "group" else "👤"
+            self.contact_tree.insert("", tk.END, text=f"{icon} {name}",
+                values=(c["talker"], c.get("type", "user")))
+        self._set_status(f"已加载 {len(contacts)} 个会话")
+
+    def _filter_contacts(self):
+        kw = self.search_var.get().lower()
+        self.contact_tree.delete(*self.contact_tree.get_children())
+        for c in self._contacts_cache:
+            name = c.get("name", c["talker"]).lower()
+            if kw and kw not in name and kw not in c["talker"].lower():
+                continue
+            icon = "👥" if c.get("type") == "group" else "👤"
+            self.contact_tree.insert("", tk.END, text=f"{icon} {c.get('name', c['talker'])}",
+                values=(c["talker"], c.get("type", "user")))
+
+    def _on_contact_select(self, event=None):
+        sel = self.contact_tree.selection()
+        if not sel:
+            return
+        values = self.contact_tree.item(sel[0], "values")
+        talker = values[0]
+        self._current_talker = talker
+        self._load_chat_history(talker)
+
+    # ─── 中栏：聊天内容 ───
+    def _build_chat_panel(self, parent):
+        # 顶部：联系人名 + 时间筛选
+        header = ttk.Frame(parent, style="Panel.TFrame")
+        header.pack(fill=tk.X)
+        self.chat_title = ttk.Label(header, text="选择联系人查看聊天", style="Heading.TLabel", padding=(15, 8))
+        self.chat_title.pack(side=tk.LEFT)
+
+        # 时间筛选区
+        filter_frame = ttk.Frame(parent, style="Panel.TFrame")
+        filter_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
+        ttk.Label(filter_frame, text="时间:", style="Muted.TLabel").pack(side=tk.LEFT)
+        self.time_filter_var = tk.StringVar(value="全部")
+        time_combo = ttk.Combobox(filter_frame, textvariable=self.time_filter_var, width=10,
+            state="readonly", values=["全部", "今天", "近3天", "近7天", "近30天", "自定义"])
+        time_combo.pack(side=tk.LEFT, padx=(5, 10))
+        time_combo.bind("<<ComboboxSelected>>", self._on_time_filter_change)
+
+        ttk.Label(filter_frame, text="从:", style="Muted.TLabel").pack(side=tk.LEFT)
+        self.date_from_var = tk.StringVar()
+        ttk.Entry(filter_frame, textvariable=self.date_from_var, width=12).pack(side=tk.LEFT, padx=(2, 5))
+        ttk.Label(filter_frame, text="到:", style="Muted.TLabel").pack(side=tk.LEFT)
+        self.date_to_var = tk.StringVar()
+        ttk.Entry(filter_frame, textvariable=self.date_to_var, width=12).pack(side=tk.LEFT, padx=(2, 5))
+
+        ttk.Button(filter_frame, text="筛选", style="Accent.TButton", command=self._apply_time_filter).pack(side=tk.LEFT, padx=5)
+        ttk.Button(filter_frame, text="AI分析", style="Accent.TButton", command=self._analyze_current_chat).pack(side=tk.RIGHT, padx=5)
+
+        # 聊天内容区（Canvas + Scroll）
+        chat_frame = ttk.Frame(parent, style="Panel.TFrame")
+        chat_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.chat_canvas = tk.Canvas(chat_frame, bg=Colors.BG_PANEL, highlightthickness=0)
+        cscroll = ttk.Scrollbar(chat_frame, command=self.chat_canvas.yview)
+        self.chat_scroll_frame = ttk.Frame(self.chat_canvas, style="Panel.TFrame")
+        self.chat_scroll_frame.bind("<Configure>",
+            lambda e: self.chat_canvas.configure(scrollregion=self.chat_canvas.bbox("all")))
+        self.chat_canvas.create_window((0, 0), window=self.chat_scroll_frame, anchor="nw")
+        self.chat_canvas.configure(yscrollcommand=cscroll.set)
+        self.chat_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        cscroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 鼠标滚轮绑定
+        self.chat_canvas.bind_all("<MouseWheel>",
+            lambda e: self.chat_canvas.yview_scroll(int(-e.delta/120), "units"))
+
+        # 底部进度提示
+        self.chat_progress = ttk.Label(parent, text="", style="Muted.TLabel", padding=(15, 4))
+        self.chat_progress.pack(fill=tk.X)
+
+    def _on_time_filter_change(self, event=None):
+        val = self.time_filter_var.get()
+        if val == "自定义":
+            # 显示日期输入框提示
+            if not self.date_from_var.get():
+                self.date_from_var.set(datetime.now().strftime("%Y-%m-%d"))
+            if not self.date_to_var.get():
+                self.date_to_var.set(datetime.now().strftime("%Y-%m-%d"))
+        elif val == "全部":
+            self.date_from_var.set("")
+            self.date_to_var.set("")
+
+    def _get_time_range(self) -> tuple[int, int]:
+        """根据筛选条件返回 (time_from, time_to) Unix 时间戳。"""
+        val = self.time_filter_var.get()
+        now = datetime.now()
+        if val == "今天":
+            t0 = now.replace(hour=0, minute=0, second=0)
+            return int(t0.timestamp()), 0
+        elif val == "近3天":
+            return int((now - timedelta(days=3)).timestamp()), 0
+        elif val == "近7天":
+            return int((now - timedelta(days=7)).timestamp()), 0
+        elif val == "近30天":
+            return int((now - timedelta(days=30)).timestamp()), 0
+        elif val == "自定义":
+            t_from, t_to = 0, 0
+            if self.date_from_var.get():
+                try:
+                    t_from = int(datetime.strptime(self.date_from_var.get(), "%Y-%m-%d").timestamp())
+                except ValueError:
+                    pass
+            if self.date_to_var.get():
+                try:
+                    t_to = int(datetime.strptime(self.date_to_var.get(), "%Y-%m-%d").replace(
+                        hour=23, minute=59, second=59).timestamp())
+                except ValueError:
+                    pass
+            return t_from, t_to
+        return 0, 0
+
+    def _apply_time_filter(self):
+        if not self._current_talker:
+            messagebox.showinfo("提示", "请先选择联系人")
+            return
+        self._load_chat_history(self._current_talker)
+
+    def _load_chat_history(self, talker: str):
+        """加载聊天历史（后台线程，含语音自动转录）。"""
+        name = ""
+        for c in self._contacts_cache:
+            if c["talker"] == talker:
+                name = c.get("name", talker)
+                break
+        self.chat_title.config(text=f"{name} ({talker})")
+
+        time_from, time_to = self._get_time_range()
+
+        def _work():
+            try:
+                extractor = self._get_extractor()
+                messages = extractor.extract_messages_by_time(talker, time_from, time_to, limit=500)
+                self.task_queue.put(("chat_loaded", messages))
+            except Exception as e:
+                self.task_queue.put(("chat_error", str(e)))
+
+        self.chat_progress.config(text="正在加载聊天记录...")
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _on_chat_loaded(self, messages):
+        """渲染聊天消息（仿微信气泡）。"""
+        # 清空旧内容
+        for w in self.chat_scroll_frame.winfo_children():
+            w.destroy()
+
+        self._current_messages = messages
+        from src.wechat_parser.message_extractor import MSG_TYPE_TEXT, MSG_TYPE_VOICE
+
+        if not messages:
+            empty = ttk.Label(self.chat_scroll_frame, text="（无聊天记录）",
+                style="Muted.TLabel", padding=(20, 20))
+            empty.pack()
+            self.chat_progress.config(text="")
+            return
+
+        voice_count = sum(1 for m in messages if m.type == MSG_TYPE_VOICE)
+        self.chat_progress.config(text=f"共 {len(messages)} 条消息（语音 {voice_count} 条）")
+
+        last_date = ""
+        for msg in messages:
+            # 日期分隔线
+            msg_date = datetime.fromtimestamp(msg.create_time).strftime("%Y-%m-%d")
+            if msg_date != last_date:
+                last_date = msg_date
+                date_label = tk.Label(self.chat_scroll_frame, text=msg_date,
+                    font=Fonts.TIMESTAMP, fg=Colors.TEXT_MUTED, bg=Colors.BG_PANEL)
+                date_label.pack(anchor="center", pady=(10, 5))
+
+            ts = datetime.fromtimestamp(msg.create_time).strftime("%H:%M")
+            is_self = bool(msg.is_sender)
+
+            if msg.type == MSG_TYPE_TEXT:
+                create_bubble_text(self.chat_scroll_frame, msg.content_text or "(空)", is_self, ts)
+            elif msg.type == MSG_TYPE_VOICE:
+                # 语音消息：显示气泡 + 自动转录按钮
+                bubble = create_bubble_text(self.chat_scroll_frame,
+                    f"🎤 语音消息 ({msg.msg_svr_id})", is_self, ts)
+                # 检查是否已转写
+                store = self._get_store()
+                cached = store.get_transcription(msg.msg_svr_id)
+                if cached:
+                    trans_label = tk.Label(self.chat_scroll_frame, text=f"📝 {cached}",
+                        font=Fonts.SMALL, fg=Colors.TEXT_SECONDARY, bg=Colors.BG_PANEL,
+                        wraplength=400, justify="left")
+                    trans_label.pack(anchor="e" if is_self else "w", padx=30, pady=(0, 5))
+                else:
+                    btn = tk.Button(self.chat_scroll_frame, text="转写此语音",
+                        font=Fonts.SMALL, fg=Colors.PRIMARY, bg=Colors.BG_PANEL,
+                        relief="flat", cursor="hand2",
+                        command=lambda m=msg: self._transcribe_one(m))
+                    btn.pack(anchor="e" if is_self else "w", padx=30, pady=(0, 5))
+            else:
+                # 其他类型
+                type_name = {3: "[图片]", 43: "[视频]", 49: "[链接/文件]"}.get(msg.type, f"[类型{msg.type}]")
+                create_bubble_text(self.chat_scroll_frame, type_name, is_self, ts)
+
+        # 滚动到底部
+        self.root.after(100, lambda: self.chat_canvas.yview_moveto(1.0))
+
+    def _transcribe_one(self, msg):
+        """转写单条语音（后台线程）。"""
+        def _work():
+            try:
+                from src.processor import process_voice_message
+                asr = self._get_asr()
+                store = self._get_store()
+                self.task_queue.put(("transcribe_progress", f"正在转写语音 {msg.msg_svr_id}..."))
+                text = process_voice_message(msg, asr, store)
+                self.task_queue.put(("transcribe_done", {"msg_svr_id": msg.msg_svr_id, "text": text}))
+            except Exception as e:
+                self.task_queue.put(("transcribe_error", str(e)))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _transcribe_all_voice(self, messages):
+        """批量转写所有语音（后台线程）。"""
+        from src.wechat_parser.message_extractor import MSG_TYPE_VOICE
+        voice_msgs = [m for m in messages if m.type == MSG_TYPE_VOICE]
+
+        def _work():
+            try:
+                from src.processor import process_voice_message
+                asr = self._get_asr()
+                store = self._get_store()
+                total = len(voice_msgs)
+                for i, msg in enumerate(voice_msgs, 1):
+                    self.task_queue.put(("transcribe_progress", f"正在转写 {i}/{total}..."))
+                    cached = store.get_transcription(msg.msg_svr_id)
+                    if cached:
+                        continue
+                    process_voice_message(msg, asr, store)
+                self.task_queue.put(("transcribe_all_done", total))
+            except Exception as e:
+                self.task_queue.put(("transcribe_error", str(e)))
+
+        if voice_msgs:
+            threading.Thread(target=_work, daemon=True).start()
+
+    # ─── 右栏：AI 分析 ───
+    def _build_analysis_panel(self, parent):
+        ttk.Label(parent, text="AI 分析", style="Heading.TLabel", padding=(15, 10)).pack(fill=tk.X)
+        ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X)
+
+        # 分析结果区
+        result_frame = ttk.Frame(parent, style="Panel.TFrame")
+        result_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        self.analysis_text = tk.Text(result_frame, wrap=tk.WORD, font=Fonts.BODY,
+            bg=Colors.BG_PANEL, fg=Colors.TEXT_PRIMARY, relief="flat",
+            padx=10, pady=10, state=tk.DISABLED)
+        ascroll = ttk.Scrollbar(result_frame, command=self.analysis_text.yview)
+        self.analysis_text.configure(yscrollcommand=ascroll.set)
+        self.analysis_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ascroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.analysis_text.insert(tk.END, "选择联系人后点击「AI分析」按钮\n\n将自动：\n1. 转写所有语音消息\n2. 提取客户需求\n3. 生成待办事项")
+        self.analysis_text.config(state=tk.DISABLED)
+
+        # 底部操作按钮
+        btn_frame = ttk.Frame(parent, style="Panel.TFrame")
+        btn_frame.pack(fill=tk.X, padx=10, pady=10)
+        ttk.Button(btn_frame, text="保存", command=self._save_analysis).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="导出", command=self._export_analysis).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="查看待办", command=self._show_todos).pack(side=tk.LEFT, padx=2)
+
+        # 当前分析结果缓存
+        self._current_analysis = None
+
+    def _analyze_current_chat(self):
+        """分析当前聊天（后台线程）：转写语音 → DeepSeek 分析。"""
+        if not self._current_talker:
+            messagebox.showinfo("提示", "请先选择联系人")
+            return
+        deepseek_key = self.config.get("llm", {}).get("deepseek", {}).get("api_key", "")
+        if not deepseek_key:
+            messagebox.showwarning("提示", "请先在「设置」中填写 DeepSeek API Key")
+            return
+
+        from src.wechat_parser.message_extractor import MSG_TYPE_TEXT, MSG_TYPE_VOICE
+
+        def _work():
+            try:
+                messages = self._current_messages
+                self.task_queue.put(("analyze_progress", "正在转写语音消息..."))
+
+                # 转写所有语音
+                from src.processor import process_voice_message
+                asr = self._get_asr()
+                store = self._get_store()
+                dialog_messages = []
+                for msg in messages:
+                    if msg.type == MSG_TYPE_TEXT:
+                        dialog_messages.append({
+                            "is_sender": msg.is_sender,
+                            "text": msg.content_text,
+                            "time": datetime.fromtimestamp(msg.create_time).strftime("%Y-%m-%d %H:%M"),
+                        })
+                    elif msg.type == MSG_TYPE_VOICE:
+                        cached = store.get_transcription(msg.msg_svr_id)
+                        if not cached:
+                            self.task_queue.put(("analyze_progress", f"转写语音 {msg.msg_svr_id}..."))
+                            cached = process_voice_message(msg, asr, store)
+                        if cached:
+                            dialog_messages.append({
+                                "is_sender": msg.is_sender,
+                                "text": f"[语音] {cached}",
+                                "time": datetime.fromtimestamp(msg.create_time).strftime("%Y-%m-%d %H:%M"),
+                            })
+
+                if not dialog_messages:
+                    self.task_queue.put(("analyze_error", "无可用消息（文本或已转写语音）"))
+                    return
+
+                self.task_queue.put(("analyze_progress", f"正在用 DeepSeek 分析 {len(dialog_messages)} 条消息..."))
+
+                # DeepSeek 分析
+                analyzer = self._get_analyzer()
+                talker_name = ""
+                for c in self._contacts_cache:
+                    if c["talker"] == self._current_talker:
+                        talker_name = c.get("name", self._current_talker)
+                        break
+
+                result = analyzer.analyze_dialog(self._current_talker, talker_name, dialog_messages)
+                store.save_analysis(result)
+
+                # 写入 TODO
+                todo_mgr = self._get_todo_mgr()
+                todo_mgr.add_from_analysis(result)
+
+                self.task_queue.put(("analyze_done", result))
+            except Exception as e:
+                self.task_queue.put(("analyze_error", str(e)))
+
+        self.analysis_text.config(state=tk.NORMAL)
+        self.analysis_text.delete("1.0", tk.END)
+        self.analysis_text.insert(tk.END, "正在分析，请稍候...\n")
+        self.analysis_text.config(state=tk.DISABLED)
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _on_analyze_done(self, result):
+        """渲染分析结果。"""
+        self._current_analysis = result
+        self.analysis_text.config(state=tk.NORMAL)
+        self.analysis_text.delete("1.0", tk.END)
+
+        self.analysis_text.insert(tk.END, "═══ 客户需求分析 ═══\n\n", "heading")
+        self.analysis_text.insert(tk.END, f"客户: {result.talker_name or result.talker}\n", "bold")
+        self.analysis_text.insert(tk.END, f"时间: {result.analyzed_at}\n")
+        self.analysis_text.insert(tk.END, f"语言: {result.language or '未知'}\n")
+        self.analysis_text.insert(tk.END, f"客户情绪: {result.customer_mood or '未知'}\n\n")
+
+        self.analysis_text.insert(tk.END, "── 摘要 ──\n", "heading")
+        self.analysis_text.insert(tk.END, f"{result.summary}\n\n")
+
+        if result.needs:
+            self.analysis_text.insert(tk.END, f"── 需求 ({len(result.needs)} 项) ──\n", "heading")
+            for i, need in enumerate(result.needs, 1):
+                self.analysis_text.insert(tk.END, f"\n{i}. [{need.category}] ", "bold")
+                if need.urgency == "high":
+                    self.analysis_text.insert(tk.END, "🔴高优 ", "danger")
+                self.analysis_text.insert(tk.END, f"{need.summary}\n")
+                if need.product:
+                    self.analysis_text.insert(tk.END, f"   产品: {need.product}")
+                    if need.quantity:
+                        self.analysis_text.insert(tk.END, f" | 数量: {need.quantity}")
+                    self.analysis_text.insert(tk.END, "\n")
+                if need.deadline:
+                    self.analysis_text.insert(tk.END, f"   截止: {need.deadline}\n")
+
+        if result.todo_items:
+            self.analysis_text.insert(tk.END, f"\n── 待办 ({len(result.todo_items)} 项) ──\n", "heading")
+            for i, todo in enumerate(result.todo_items, 1):
+                self.analysis_text.insert(tk.END, f"  ☐ {todo}\n")
+
+        if result.done_items:
+            self.analysis_text.insert(tk.END, f"\n── 已办 ({len(result.done_items)} 项) ──\n", "heading")
+            for done in result.done_items:
+                self.analysis_text.insert(tk.END, f"  ☑ {done}\n")
+
+        # 配置标签样式
+        self.analysis_text.tag_config("heading", font=Fonts.HEADING, foreground=Colors.PRIMARY)
+        self.analysis_text.tag_config("bold", font=Fonts.BODY_BOLD)
+        self.analysis_text.tag_config("danger", foreground=Colors.DANGER)
+
+        self.analysis_text.config(state=tk.DISABLED)
+        self._set_status("分析完成，结果已保存")
+
+    def _save_analysis(self):
+        if not self._current_analysis:
+            messagebox.showinfo("提示", "暂无分析结果")
+            return
+        # 已在分析时保存到 store，这里提示
+        messagebox.showinfo("已保存", "分析结果已保存到本地数据库")
+
+    def _export_analysis(self):
+        if not self._current_analysis:
+            messagebox.showinfo("提示", "暂无分析结果")
+            return
+        path = filedialog.asksaveasfilename(
+            title="导出分析结果",
+            defaultextension=".md",
+            filetypes=[("Markdown", "*.md"), ("文本", "*.txt"), ("JSON", "*.json")],
         )
-        self.engine_label.pack(side=tk.RIGHT, padx=(0, 15))
+        if not path:
+            return
+        try:
+            r = self._current_analysis
+            if path.endswith(".json"):
+                data = {
+                    "talker": r.talker, "talker_name": r.talker_name,
+                    "language": r.language, "summary": r.summary,
+                    "customer_mood": r.customer_mood, "analyzed_at": r.analyzed_at,
+                    "needs": [{"category": n.category, "summary": n.summary, "product": n.product,
+                        "quantity": n.quantity, "deadline": n.deadline, "urgency": n.urgency} for n in r.needs],
+                    "todo_items": r.todo_items, "done_items": r.done_items,
+                }
+                Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            else:
+                lines = [f"# 客户需求分析 - {r.talker_name or r.talker}", ""]
+                lines.append(f"- 时间: {r.analyzed_at}")
+                lines.append(f"- 语言: {r.language or '未知'}")
+                lines.append(f"- 客户情绪: {r.customer_mood or '未知'}")
+                lines.append(f"\n## 摘要\n\n{r.summary}")
+                if r.needs:
+                    lines.append(f"\n## 需求 ({len(r.needs)} 项)")
+                    for i, n in enumerate(r.needs, 1):
+                        lines.append(f"\n{i}. **[{n.category}]** {n.summary}")
+                        if n.product:
+                            lines.append(f"   - 产品: {n.product} | 数量: {n.quantity or '未知'}")
+                        if n.deadline:
+                            lines.append(f"   - 截止: {n.deadline}")
+                if r.todo_items:
+                    lines.append(f"\n## 待办 ({len(r.todo_items)} 项)")
+                    for t in r.todo_items:
+                        lines.append(f"- [ ] {t}")
+                if r.done_items:
+                    lines.append(f"\n## 已办 ({len(r.done_items)} 项)")
+                    for d in r.done_items:
+                        lines.append(f"- [x] {d}")
+                Path(path).write_text("\n".join(lines), encoding="utf-8")
+            messagebox.showinfo("成功", f"已导出到:\n{path}")
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
 
-        # 分隔线
-        ttk.Separator(self.root).pack(fill=tk.X, padx=10)
+    # ─── 设置弹窗 ───
+    def _show_settings(self):
+        win = tk.Toplevel(self.root)
+        win.title("设置")
+        win.geometry("560x640")
+        win.transient(self.root)
+        win.grab_set()
 
-        # 标签页
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        apply_theme(win)
+        container = ttk.Frame(win, style="Panel.TFrame")
+        container.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
 
-        self.config_tab = ttk.Frame(notebook)
-        self.monitor_tab = ttk.Frame(notebook)
-        self.transcribe_tab = ttk.Frame(notebook)
-        self.todo_tab = ttk.Frame(notebook)
+        # 微信配置
+        ttk.Label(container, text="微信数据配置", style="Heading.TLabel").pack(anchor=tk.W, pady=(0, 5))
 
-        notebook.add(self.config_tab, text="  配置  ")
-        notebook.add(self.monitor_tab, text="  准实时监听  ")
-        notebook.add(self.transcribe_tab, text="  语音转写  ")
-        notebook.add(self.todo_tab, text="  待办事项  ")
+        wechat_frame = ttk.LabelFrame(container, text="微信", padding=10)
+        wechat_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(wechat_frame, text="数据目录:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.cfg_wechat_path = tk.StringVar(value=self.config.get("wechat", {}).get("db_storage_path", ""))
+        ttk.Entry(wechat_frame, textvariable=self.cfg_wechat_path, width=45).grid(row=0, column=1, pady=2)
+        ttk.Button(wechat_frame, text="自动检测", command=lambda: self._auto_detect_in_settings()).grid(row=0, column=2, padx=3)
 
-        self._build_config_tab()
-        self._build_monitor_tab()
-        self._build_transcribe_tab()
-        self._build_todo_tab()
+        ttk.Label(wechat_frame, text="进程名:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.cfg_process_name = tk.StringVar(value=self.config.get("wechat", {}).get("process_name", ""))
+        ttk.Entry(wechat_frame, textvariable=self.cfg_process_name, width=30).grid(row=1, column=1, sticky=tk.W, pady=2)
 
-    # ──────── 配置页 ────────
-    def _build_config_tab(self):
-        tab = self.config_tab
-        canvas = tk.Canvas(tab, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=canvas.yview)
-        scroll_frame = ttk.Frame(canvas)
-        scroll_frame.bind(
-            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        ttk.Label(wechat_frame, text="密钥(可选):").grid(row=2, column=0, sticky=tk.W, pady=2)
+        self.cfg_raw_key = tk.StringVar(value=self.config.get("wechat", {}).get("raw_key", ""))
+        ttk.Entry(wechat_frame, textvariable=self.cfg_raw_key, width=45, show="*").grid(row=2, column=1, pady=2)
+        ttk.Label(wechat_frame, text="96字符hex，留空自动扫描", style="Muted.TLabel").grid(row=2, column=2, padx=3)
 
-        f = scroll_frame
-        cfg = self.config
+        # ASR 配置
+        ttk.Label(container, text="语音识别 (ASR)", style="Heading.TLabel").pack(anchor=tk.W, pady=(15, 5))
+        asr_frame = ttk.LabelFrame(container, text="ASR 引擎", padding=10)
+        asr_frame.pack(fill=tk.X, pady=5)
+        self.cfg_asr_engine = tk.StringVar(value=self.config.get("asr", {}).get("engine", "volcengine"))
+        mlx_ok = _is_mlx_whisper_available()
+        engines = ["volcengine", "openai"] + (["mlx_whisper"] if mlx_ok else [])
+        ttk.Label(asr_frame, text="引擎:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        ttk.Combobox(asr_frame, textvariable=self.cfg_asr_engine, values=engines,
+            state="readonly", width=18).grid(row=0, column=1, sticky=tk.W, pady=2)
+        hint = "Mac M3 可用 mlx_whisper(免费)" if mlx_ok else "精简版用 volcengine/openai"
+        ttk.Label(asr_frame, text=hint, style="Muted.TLabel").grid(row=0, column=2, padx=5)
 
-        # ── 微信配置 ──
-        ttk.Label(f, text="微信数据配置", font=("", 11, "bold")).grid(
-            row=0, column=0, columnspan=3, sticky=tk.W, padx=15, pady=(15, 5)
-        )
-        ttk.Label(f, text="db_storage 路径:").grid(row=1, column=0, sticky=tk.W, padx=15, pady=3)
-        self.cfg_wechat_path = tk.StringVar(value=cfg.get("wechat", {}).get("db_storage_path", ""))
-        ttk.Entry(f, textvariable=self.cfg_wechat_path, width=50).grid(row=1, column=1, pady=3)
-        ttk.Button(f, text="浏览...", command=self._browse_wechat_path).grid(row=1, column=2, padx=5)
+        ttk.Label(asr_frame, text="火山AppID:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.cfg_volc_appid = tk.StringVar(value=self.config.get("asr", {}).get("volcengine", {}).get("app_id", ""))
+        ttk.Entry(asr_frame, textvariable=self.cfg_volc_appid, width=35).grid(row=1, column=1, pady=2)
+        ttk.Label(asr_frame, text="火山Token:").grid(row=2, column=0, sticky=tk.W, pady=2)
+        self.cfg_volc_token = tk.StringVar(value=self.config.get("asr", {}).get("volcengine", {}).get("access_token", ""))
+        ttk.Entry(asr_frame, textvariable=self.cfg_volc_token, width=35, show="*").grid(row=2, column=1, pady=2)
 
-        ttk.Label(f, text="微信进程名:").grid(row=2, column=0, sticky=tk.W, padx=15, pady=3)
-        self.cfg_process_name = tk.StringVar(value=cfg.get("wechat", {}).get("process_name", "WeChat.exe"))
-        ttk.Entry(f, textvariable=self.cfg_process_name, width=30).grid(row=2, column=1, sticky=tk.W, pady=3)
-        ttk.Label(f, text="(Win: WeChat.exe / Mac: 微信)", foreground="gray").grid(
-            row=2, column=2, sticky=tk.W
-        )
+        # DeepSeek
+        ttk.Label(container, text="DeepSeek 大模型", style="Heading.TLabel").pack(anchor=tk.W, pady=(15, 5))
+        ds_frame = ttk.LabelFrame(container, text="DeepSeek", padding=10)
+        ds_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(ds_frame, text="API Key:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.cfg_deepseek_key = tk.StringVar(value=self.config.get("llm", {}).get("deepseek", {}).get("api_key", ""))
+        ttk.Entry(ds_frame, textvariable=self.cfg_deepseek_key, width=45, show="*").grid(row=0, column=1, pady=2)
 
-        # ── ASR 配置 ──
-        ttk.Label(f, text="语音识别 (ASR) 配置", font=("", 11, "bold")).grid(
-            row=3, column=0, columnspan=3, sticky=tk.W, padx=15, pady=(15, 5)
-        )
-        ttk.Label(f, text="ASR 引擎:").grid(row=4, column=0, sticky=tk.W, padx=15, pady=3)
-        self.cfg_asr_engine = tk.StringVar(value=cfg.get("asr", {}).get("engine", "volcengine"))
-        # 检测 mlx_whisper 是否可用（精简模式打包不含）
-        mlx_available = _is_mlx_whisper_available()
-        engine_values = ["volcengine", "openai"]
-        if mlx_available:
-            engine_values.append("mlx_whisper")
-        engine_combo = ttk.Combobox(
-            f, textvariable=self.cfg_asr_engine, width=20, state="readonly",
-            values=engine_values,
-        )
-        engine_combo.grid(row=4, column=1, sticky=tk.W, pady=3)
-        engine_combo.bind("<<ComboboxSelected>>", self._on_asr_engine_change)
-        if mlx_available:
-            engine_hint = "Mac M3 选 mlx_whisper(免费)\nWin 选 volcengine(~7元/月)"
+        # 保存按钮
+        ttk.Button(container, text="💾 保存配置", style="Accent.TButton",
+            command=lambda: self._save_settings(win)).pack(pady=20)
+
+    def _auto_detect_in_settings(self):
+        from src.wechat_parser.wechat_detector import detect_wechat
+        detection = detect_wechat()
+        if detection.found:
+            self.cfg_wechat_path.set(detection.db_storage_path)
+            self.cfg_process_name.set(detection.process_name)
+            messagebox.showinfo("检测成功",
+                f"已检测到微信:\n{detection.db_storage_path}\n\n进程: {detection.process_name}\n运行中: {detection.process_running}")
         else:
-            engine_hint = "精简版不含 MLX(用云端)\n完整版: INCLUDE_MLX=1 bash build_mac.sh"
-        ttk.Label(
-            f, text=engine_hint, foreground="gray", justify=tk.LEFT,
-        ).grid(row=4, column=2, sticky=tk.W, padx=5)
+            messagebox.showwarning("未检测到", "未找到微信数据目录，请手动选择")
+            path = filedialog.askdirectory(title="选择微信 db_storage 目录")
+            if path:
+                self.cfg_wechat_path.set(path)
 
-        # 火山豆包
-        self.volc_frame = ttk.LabelFrame(f, text="火山豆包 ASR (推荐 Windows)", padding=10)
-        self.volc_frame.grid(row=5, column=0, columnspan=3, sticky=tk.EW, padx=15, pady=5)
-        ttk.Label(self.volc_frame, text="App ID:").grid(row=0, column=0, sticky=tk.W, pady=2)
-        self.cfg_volc_appid = tk.StringVar(value=cfg.get("asr", {}).get("volcengine", {}).get("app_id", ""))
-        ttk.Entry(self.volc_frame, textvariable=self.cfg_volc_appid, width=40).grid(row=0, column=1, pady=2)
-        ttk.Label(self.volc_frame, text="Access Token:").grid(row=1, column=0, sticky=tk.W, pady=2)
-        self.cfg_volc_token = tk.StringVar(value=cfg.get("asr", {}).get("volcengine", {}).get("access_token", ""))
-        ttk.Entry(self.volc_frame, textvariable=self.cfg_volc_token, width=40, show="*").grid(row=1, column=1, pady=2)
-
-        # MLX Whisper
-        self.mlx_frame = ttk.LabelFrame(f, text="MLX Whisper (仅 Mac M3, 免费)", padding=10)
-        self.mlx_frame.grid(row=6, column=0, columnspan=3, sticky=tk.EW, padx=15, pady=5)
-        ttk.Label(self.mlx_frame, text="模型:").grid(row=0, column=0, sticky=tk.W, pady=2)
-        self.cfg_mlx_model = tk.StringVar(
-            value=cfg.get("asr", {}).get("mlx_whisper", {}).get("model", "mlx-community/whisper-medium-mlx-8bit")
-        )
-        ttk.Entry(self.mlx_frame, textvariable=self.cfg_mlx_model, width=55).grid(row=0, column=1, pady=2)
-
-        # OpenAI
-        self.openai_frame = ttk.LabelFrame(f, text="OpenAI (最高准确率, ~11元/月)", padding=10)
-        self.openai_frame.grid(row=7, column=0, columnspan=3, sticky=tk.EW, padx=15, pady=5)
-        ttk.Label(self.openai_frame, text="API Key:").grid(row=0, column=0, sticky=tk.W, pady=2)
-        self.cfg_openai_key = tk.StringVar(value=cfg.get("asr", {}).get("openai", {}).get("api_key", ""))
-        ttk.Entry(self.openai_frame, textvariable=self.cfg_openai_key, width=50, show="*").grid(row=0, column=1, pady=2)
-
-        self._on_asr_engine_change()  # 初始显示/隐藏
-
-        # ── DeepSeek 配置 ──
-        ttk.Label(f, text="DeepSeek 大模型配置 (月费<1元)", font=("", 11, "bold")).grid(
-            row=8, column=0, columnspan=3, sticky=tk.W, padx=15, pady=(15, 5)
-        )
-        ttk.Label(f, text="API Key:").grid(row=9, column=0, sticky=tk.W, padx=15, pady=3)
-        self.cfg_deepseek_key = tk.StringVar(value=cfg.get("llm", {}).get("deepseek", {}).get("api_key", ""))
-        ttk.Entry(f, textvariable=self.cfg_deepseek_key, width=50, show="*").grid(row=9, column=1, sticky=tk.W, pady=3)
-        ttk.Label(f, text="获取: platform.deepseek.com", foreground="gray").grid(row=9, column=2, sticky=tk.W)
-
-        # ── 保存按钮 ──
-        ttk.Button(f, text="💾 保存配置", command=self._on_save_config).grid(
-            row=10, column=0, columnspan=3, pady=20
-        )
-
-    def _on_asr_engine_change(self, event=None):
-        engine = self.cfg_asr_engine.get()
-        self.volc_frame.grid_remove()
-        self.mlx_frame.grid_remove()
-        self.openai_frame.grid_remove()
-        if engine == "volcengine":
-            self.volc_frame.grid()
-        elif engine == "mlx_whisper":
-            self.mlx_frame.grid()
-        elif engine == "openai":
-            self.openai_frame.grid()
-
-    def _browse_wechat_path(self):
-        path = filedialog.askdirectory(title="选择微信 db_storage 目录")
-        if path:
-            self.cfg_wechat_path.set(path)
-
-    def _on_save_config(self):
+    def _save_settings(self, win):
         self.config.setdefault("wechat", {})
         self.config["wechat"]["db_storage_path"] = self.cfg_wechat_path.get()
         self.config["wechat"]["process_name"] = self.cfg_process_name.get()
+        self.config["wechat"]["raw_key"] = self.cfg_raw_key.get()
         self.config.setdefault("asr", {})
         self.config["asr"]["engine"] = self.cfg_asr_engine.get()
         self.config["asr"].setdefault("volcengine", {})
         self.config["asr"]["volcengine"]["app_id"] = self.cfg_volc_appid.get()
         self.config["asr"]["volcengine"]["access_token"] = self.cfg_volc_token.get()
-        self.config["asr"].setdefault("mlx_whisper", {})
-        self.config["asr"]["mlx_whisper"]["model"] = self.cfg_mlx_model.get()
-        self.config["asr"].setdefault("openai", {})
-        self.config["asr"]["openai"]["api_key"] = self.cfg_openai_key.get()
         self.config.setdefault("llm", {}).setdefault("deepseek", {})
         self.config["llm"]["deepseek"]["api_key"] = self.cfg_deepseek_key.get()
         self.config.setdefault("storage", {})
         self.config["storage"]["db_path"] = str(get_db_path())
-
         self._save_config()
-        self._reset_runtimes()
+        # 重置运行时组件
+        self._decryptor = None
+        self._extractor = None
+        self._asr_engine = None
+        self._analyzer = None
         self.engine_label.config(text=f"ASR: {self.cfg_asr_engine.get()}")
-        messagebox.showinfo("成功", f"配置已保存到:\n{self.config_path}")
+        win.destroy()
+        messagebox.showinfo("成功", "配置已保存")
 
-    # ──────── 监听页 ────────
-    def _build_monitor_tab(self):
-        tab = self.monitor_tab
-        btn_frame = ttk.Frame(tab)
-        btn_frame.pack(fill=tk.X, padx=10, pady=5)
-        self.btn_start = ttk.Button(btn_frame, text="▶ 启动监听", command=self._start_monitor)
-        self.btn_start.pack(side=tk.LEFT, padx=5)
-        self.btn_stop = ttk.Button(btn_frame, text="⏹ 停止监听", command=self._stop_monitor, state=tk.DISABLED)
-        self.btn_stop.pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="清空日志", command=self._clear_log).pack(side=tk.RIGHT, padx=5)
+    # ─── 待办弹窗 ───
+    def _show_todos(self):
+        win = tk.Toplevel(self.root)
+        win.title("待办事项")
+        win.geometry("700x500")
+        win.transient(self.root)
+        apply_theme(win)
 
-        ttk.Label(tab, text="实时日志:", font=("", 10, "bold")).pack(anchor=tk.W, padx=10, pady=(5, 0))
-        self.log_text = tk.Text(tab, height=25, wrap=tk.WORD, font=("Courier", 10))
-        log_scroll = ttk.Scrollbar(tab, command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=log_scroll.set)
-        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0), pady=5)
-        log_scroll.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 10), pady=5)
+        top = ttk.Frame(win, style="Panel.TFrame")
+        top.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Button(top, text="刷新", command=lambda: self._load_todos(tree)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="标记完成", command=lambda: self._mark_done(tree)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="生成提醒", command=lambda: self._gen_reminder(text_area)).pack(side=tk.LEFT, padx=2)
 
-    def _start_monitor(self):
-        if self.is_monitoring:
-            return
-        wechat_path = self.config.get("wechat", {}).get("db_storage_path", "")
-        if not wechat_path:
-            messagebox.showwarning("提示", "请先在「配置」页填写微信 db_storage 路径")
-            return
-        deepseek_key = self.config.get("llm", {}).get("deepseek", {}).get("api_key", "")
-        if not deepseek_key:
-            messagebox.showwarning("提示", "请先在「配置」页填写 DeepSeek API Key")
-            return
+        cols = ("id", "customer", "content", "category", "urgency", "created")
+        tree = ttk.Treeview(win, columns=cols, show="headings", height=12)
+        for c, t, w in [("id", "ID", 40), ("customer", "客户", 120), ("content", "待办内容", 280),
+                        ("category", "分类", 80), ("urgency", "优先级", 70), ("created", "创建时间", 140)]:
+            tree.heading(c, text=t)
+            tree.column(c, width=w)
+        tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        self.is_monitoring = True
-        self.monitor_stop_event.clear()
-        self.btn_start.config(state=tk.DISABLED)
-        self.btn_stop.config(state=tk.NORMAL)
-        self.status_label.config(text="状态: 监听中...", foreground="green")
-        self._log("启动准实时监听...")
+        ttk.Label(win, text="提醒文案:", style="Heading.TLabel").pack(anchor=tk.W, padx=10)
+        text_area = tk.Text(win, height=8, wrap=tk.WORD, font=Fonts.MONO)
+        text_area.pack(fill=tk.BOTH, expand=False, padx=10, pady=5)
 
-        self.monitor_thread = threading.Thread(
-            target=self._monitor_worker, daemon=True, name="wechat-monitor"
-        )
-        self.monitor_thread.start()
+        self._load_todos(tree)
 
-    def _stop_monitor(self):
-        if not self.is_monitoring:
-            return
-        self.is_monitoring = False
-        self.monitor_stop_event.set()
-        self.btn_start.config(state=tk.NORMAL)
-        self.btn_stop.config(state=tk.DISABLED)
-        self.status_label.config(text="状态: 已停止", foreground="gray")
-        self._log("正在停止监听...")
-
-    def _monitor_worker(self):
-        """后台监听线程：解析微信 → 转写 → 分析 → 通过 queue 通知 UI。"""
+    def _load_todos(self, tree):
+        tree.delete(*tree.get_children())
         try:
-            from src.asr.base import create_asr
-            from src.llm.deepseek_analyzer import DeepSeekAnalyzer
-            from src.processor import handle_new_messages
-            from src.reminder.todo_manager import TodoManager
-            from src.storage.store import Store
-            from src.wechat_parser.decryptor import WeChatDecryptor, scan_wechat_key
-            from src.wechat_parser.message_extractor import MessageExtractor, RealtimeMonitor
-
-            wechat_cfg = self.config["wechat"]
-            self.message_queue.put(("log", "正在扫描微信密钥..."))
-
-            raw_key = scan_wechat_key(wechat_cfg["process_name"])
-            decryptor = WeChatDecryptor.from_raw_key_hex(raw_key, wechat_cfg["db_storage_path"])
-            self.message_queue.put(("log", "密钥获取成功"))
-
-            store = Store(self.config.get("storage", {}).get("db_path") or str(get_db_path()))
-            asr_engine = create_asr(self.config["asr"])
-            analyzer = DeepSeekAnalyzer(self.config["llm"]["deepseek"])
-            todo_mgr = TodoManager(store)
-
-            self.message_queue.put(("log", f"ASR 引擎: {asr_engine.name()}"))
-            self.message_queue.put(("log", f"监听目录: {wechat_cfg['db_storage_path']}"))
-
-            extractor = MessageExtractor(decryptor, wechat_cfg["db_storage_path"])
-
-            def on_new(talker, messages):
-                if self.monitor_stop_event.is_set():
-                    return
-                self.message_queue.put(("log", f"收到 {talker} 的 {len(messages)} 条新消息"))
-                try:
-                    result = handle_new_messages(talker, messages, asr_engine, analyzer, todo_mgr, store)
-                    if result:
-                        self.message_queue.put(("analysis", result))
-                except Exception as e:
-                    self.message_queue.put(("log", f"处理失败: {e}"))
-
-            monitor = RealtimeMonitor(
-                db_storage_path=wechat_cfg["db_storage_path"],
-                extractor=extractor,
-                on_new_messages=on_new,
-                poll_interval_ms=wechat_cfg.get("poll_interval_ms", 100),
-                debounce_ms=wechat_cfg.get("debounce_ms", 200),
-                watch_talkers=wechat_cfg.get("watch_talkers", []),
-                ignore_talkers=wechat_cfg.get("ignore_talkers", ["filehelper", "weixin"]),
-            )
-            monitor.start()
-            self.message_queue.put(("log", "监听已启动，等待新消息..."))
-
-            while not self.monitor_stop_event.is_set():
-                time.sleep(0.5)
-
-            monitor.stop()
-            self.message_queue.put(("log", "监听已停止"))
-
-        except Exception as e:
-            self.message_queue.put(("log", f"监听异常: {e}"))
-            logger.error("监听异常", exc_info=True)
-        finally:
-            self.message_queue.put(("stopped", None))
-
-    # ──────── 转写页 ────────
-    def _build_transcribe_tab(self):
-        tab = self.transcribe_tab
-        input_frame = ttk.Frame(tab)
-        input_frame.pack(fill=tk.X, padx=10, pady=10)
-        ttk.Label(input_frame, text="SILK 语音文件:").grid(row=0, column=0, padx=5)
-        self.silk_path_var = tk.StringVar()
-        ttk.Entry(input_frame, textvariable=self.silk_path_var, width=50).grid(row=0, column=1, padx=5)
-        ttk.Button(input_frame, text="选择文件...", command=self._browse_silk).grid(row=0, column=2, padx=5)
-
-        btn_frame = ttk.Frame(tab)
-        btn_frame.pack(fill=tk.X, padx=10, pady=5)
-        self.btn_transcribe = ttk.Button(btn_frame, text="🎙 开始转写", command=self._do_transcribe)
-        self.btn_transcribe.pack(side=tk.LEFT, padx=5)
-        ttk.Label(btn_frame, text="(支持 .silk / .amr 微信语音文件)", foreground="gray").pack(side=tk.LEFT)
-
-        ttk.Label(tab, text="转写结果:", font=("", 10, "bold")).pack(anchor=tk.W, padx=10, pady=(10, 0))
-        result_frame = ttk.Frame(tab)
-        result_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        self.transcribe_result = tk.Text(result_frame, height=15, wrap=tk.WORD, font=("", 11))
-        tr_scroll = ttk.Scrollbar(result_frame, command=self.transcribe_result.yview)
-        self.transcribe_result.configure(yscrollcommand=tr_scroll.set)
-        self.transcribe_result.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        tr_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-
-    def _browse_silk(self):
-        path = filedialog.askopenfilename(
-            title="选择微信语音文件",
-            filetypes=[("微信语音", "*.silk *.amr"), ("所有文件", "*.*")],
-        )
-        if path:
-            self.silk_path_var.set(path)
-
-    def _do_transcribe(self):
-        silk_path = self.silk_path_var.get().strip()
-        if not silk_path or not Path(silk_path).exists():
-            messagebox.showwarning("提示", "请选择有效的 SILK 语音文件")
-            return
-        deepseek_key = self.config.get("llm", {}).get("deepseek", {}).get("api_key", "")
-        if not deepseek_key:
-            messagebox.showwarning("提示", "请先在「配置」页填写 DeepSeek API Key")
-            return
-
-        self.btn_transcribe.config(state=tk.DISABLED, text="转写中...")
-        self.transcribe_result.delete("1.0", tk.END)
-        self.transcribe_result.insert(tk.END, "正在转写，请稍候...\n")
-
-        threading.Thread(
-            target=self._transcribe_worker, args=(silk_path,), daemon=True
-        ).start()
-
-    def _transcribe_worker(self, silk_path: str):
-        try:
-            from src.asr.base import create_asr
-            from src.wechat_parser.silk_decoder import silk_to_wav
-
-            asr_engine = create_asr(self.config["asr"])
-            tmp_dir = get_app_dir() / "tmp"
-            tmp_dir.mkdir(parents=True, exist_ok=True)
-            wav_path = str(tmp_dir / "transcribe_tmp.wav")
-
-            self.message_queue.put(("transcribe_log", f"引擎: {asr_engine.name()}"))
-            self.message_queue.put(("transcribe_log", "SILK → WAV 转换中..."))
-            duration = silk_to_wav(silk_path, wav_path)
-            self.message_queue.put(("transcribe_log", f"时长: {duration:.1f} 秒, 开始识别..."))
-
-            text = asr_engine.transcribe(wav_path)
-            Path(wav_path).unlink(missing_ok=True)
-
-            self.message_queue.put(("transcribe_done", {"duration": duration, "text": text, "engine": asr_engine.name()}))
-
-        except Exception as e:
-            self.message_queue.put(("transcribe_error", str(e)))
-
-    # ──────── 待办页 ────────
-    def _build_todo_tab(self):
-        tab = self.todo_tab
-        btn_frame = ttk.Frame(tab)
-        btn_frame.pack(fill=tk.X, padx=10, pady=5)
-        ttk.Button(btn_frame, text="🔄 刷新列表", command=self._refresh_todos).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="📋 生成提醒", command=self._generate_reminder).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="✓ 标记完成", command=self._mark_todo_done).pack(side=tk.LEFT, padx=5)
-
-        # 待办列表
-        list_frame = ttk.LabelFrame(tab, text="待办事项", padding=5)
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-        columns = ("id", "customer", "content", "category", "urgency", "created", "status")
-        self.todo_tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=12)
-        self.todo_tree.heading("id", text="ID")
-        self.todo_tree.heading("customer", text="客户")
-        self.todo_tree.heading("content", text="待办内容")
-        self.todo_tree.heading("category", text="分类")
-        self.todo_tree.heading("urgency", text="优先级")
-        self.todo_tree.heading("created", text="创建时间")
-        self.todo_tree.heading("status", text="状态")
-        self.todo_tree.column("id", width=40)
-        self.todo_tree.column("customer", width=120)
-        self.todo_tree.column("content", width=280)
-        self.todo_tree.column("category", width=80)
-        self.todo_tree.column("urgency", width=70)
-        self.todo_tree.column("created", width=140)
-        self.todo_tree.column("status", width=60)
-        todo_scroll = ttk.Scrollbar(list_frame, command=self.todo_tree.yview)
-        self.todo_tree.configure(yscrollcommand=todo_scroll.set)
-        self.todo_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        todo_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # 提醒文案
-        ttk.Label(tab, text="提醒文案:", font=("", 10, "bold")).pack(anchor=tk.W, padx=10, pady=(5, 0))
-        reminder_frame = ttk.Frame(tab)
-        reminder_frame.pack(fill=tk.BOTH, expand=False, padx=10, pady=5)
-        self.reminder_text = tk.Text(reminder_frame, height=8, wrap=tk.WORD, font=("Courier", 10))
-        rr_scroll = ttk.Scrollbar(reminder_frame, command=self.reminder_text.yview)
-        self.reminder_text.configure(yscrollcommand=rr_scroll.set)
-        self.reminder_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        rr_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-
-    def _refresh_todos(self):
-        try:
-            store = self._get_store()
-            from src.reminder.todo_manager import TodoManager
-            todo_mgr = TodoManager(store)
+            todo_mgr = self._get_todo_mgr()
             todos = todo_mgr.get_pending_todos()
-
-            self.todo_tree.delete(*self.todo_tree.get_children())
             for t in todos:
-                urgency_label = {"high": "高", "normal": "普通", "low": "低"}.get(t.urgency, t.urgency)
-                cat_label = {
-                    "inquiry": "询价", "quotation": "报价", "sample": "样品",
-                    "order": "订单", "logistics": "物流", "payment": "付款",
-                    "complaint": "投诉", "other": "其他",
-                }.get(t.category, t.category)
-                created_short = t.created_at[:16].replace("T", " ") if t.created_at else ""
-                self.todo_tree.insert("", tk.END, values=(
-                    t.id, t.talker_name or t.talker, t.content,
-                    cat_label, urgency_label, created_short, t.status,
-                ))
-            self._log(f"刷新待办: {len(todos)} 项")
+                urgency = {"high": "高", "normal": "普通", "low": "低"}.get(t.urgency, t.urgency)
+                cat = {"inquiry": "询价", "quotation": "报价", "order": "订单", "logistics": "物流"}.get(t.category, t.category)
+                tree.insert("", tk.END, values=(t.id, t.talker_name or t.talker, t.content,
+                    cat, urgency, t.created_at[:16].replace("T", " ") if t.created_at else ""))
         except Exception as e:
-            messagebox.showerror("错误", f"刷新失败: {e}")
+            messagebox.showerror("错误", str(e))
 
-    def _generate_reminder(self):
-        try:
-            store = self._get_store()
-            from src.reminder.todo_manager import TodoManager
-            todo_mgr = TodoManager(store)
-            text = todo_mgr.generate_reminder(
-                granularity=self.config.get("reminder", {}).get("granularity", "daily")
-            )
-            self.reminder_text.delete("1.0", tk.END)
-            self.reminder_text.insert("1.0", text)
-        except Exception as e:
-            messagebox.showerror("错误", f"生成提醒失败: {e}")
-
-    def _mark_todo_done(self):
-        selected = self.todo_tree.selection()
-        if not selected:
-            messagebox.showwarning("提示", "请先选择一条待办")
+    def _mark_done(self, tree):
+        sel = tree.selection()
+        if not sel:
             return
-        item = self.todo_tree.item(selected[0])
-        todo_id = int(item["values"][0])
+        todo_id = int(tree.item(sel[0])["values"][0])
         try:
-            store = self._get_store()
-            from src.reminder.todo_manager import TodoManager
-            todo_mgr = TodoManager(store)
-            todo_mgr.mark_done(todo_id)
-            self._refresh_todos()
-            self._log(f"标记完成: #{todo_id}")
+            self._get_todo_mgr().mark_done(todo_id)
+            self._load_todos(tree)
         except Exception as e:
-            messagebox.showerror("错误", f"标记失败: {e}")
+            messagebox.showerror("错误", str(e))
 
-    # ═══════ 队列轮询（线程安全更新 UI）═══════
+    def _gen_reminder(self, text_area):
+        try:
+            text = self._get_todo_mgr().generate_reminder(
+                granularity=self.config.get("reminder", {}).get("granularity", "daily"))
+            text_area.delete("1.0", tk.END)
+            text_area.insert("1.0", text)
+        except Exception as e:
+            messagebox.showerror("错误", str(e))
+
+    # ─── MCP 信息 ───
+    def _show_mcp_info(self):
+        win = tk.Toplevel(self.root)
+        win.title("MCP 协议")
+        win.geometry("600x480")
+        win.transient(self.root)
+        apply_theme(win)
+        container = ttk.Frame(win, style="Panel.TFrame")
+        container.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+
+        ttk.Label(container, text="MCP 协议支持", style="Title.TLabel").pack(anchor=tk.W)
+        ttk.Label(container, text="通过 MCP 协议，外部 AI 客户端（Claude Desktop / Trae）可用自然语言查询聊天记录",
+            style="Muted.TLabel").pack(anchor=tk.W, pady=(0, 15))
+
+        info = tk.Text(container, wrap=tk.WORD, font=Fonts.MONO, height=18)
+        info.pack(fill=tk.BOTH, expand=True)
+        info.insert(tk.END, "可用工具:\n")
+        info.insert(tk.END, "  • search_chats - 关键词搜索聊天记录\n")
+        info.insert(tk.END, "  • list_contacts - 列出联系人\n")
+        info.insert(tk.END, "  • get_chat_history - 获取聊天历史\n")
+        info.insert(tk.END, "  • transcribe_voice - 转写语音\n")
+        info.insert(tk.END, "  • analyze_customer - 分析客户需求\n")
+        info.insert(tk.END, "  • search_by_natural_language - 自然语言搜索\n\n")
+        info.insert(tk.END, "启动 MCP server:\n")
+        info.insert(tk.END, "  终端运行: 外贸助手 --mcp\n\n")
+        info.insert(tk.END, "Claude Desktop 配置 (~/Library/Application Support/Claude/claude_desktop_config.json):\n")
+        info.insert(tk.END, '{\n')
+        info.insert(tk.END, '  "mcpServers": {\n')
+        info.insert(tk.END, '    "trade-tools": {\n')
+        info.insert(tk.END, '      "command": "/path/to/外贸助手.app/Contents/MacOS/TradeTools",\n')
+        info.insert(tk.END, '      "args": ["--mcp"]\n')
+        info.insert(tk.END, '    }\n')
+        info.insert(tk.END, '  }\n')
+        info.insert(tk.END, '}\n\n')
+        info.insert(tk.END, "配置后在 Claude Desktop 中即可用自然语言查询，如:\n")
+        info.insert(tk.END, '  "帮我找上周和张三聊的关于报价的记录"')
+        info.config(state=tk.DISABLED)
+
+    # ═══════ 队列轮询 ═══════
     def _poll_queue(self):
         try:
             while True:
                 try:
-                    msg_type, data = self.message_queue.get_nowait()
+                    msg_type, data = self.task_queue.get_nowait()
                 except queue.Empty:
                     break
 
-                if msg_type == "log":
-                    self._log(data)
-                elif msg_type == "analysis":
-                    self._log(f"分析完成: {data.summary[:60]}")
-                    self._log(f"  待办: {len(data.todo_items)} 项, 已办: {len(data.done_items)} 项")
-                elif msg_type == "stopped":
-                    self.is_monitoring = False
-                    self.btn_start.config(state=tk.NORMAL)
-                    self.btn_stop.config(state=tk.DISABLED)
-                    self.status_label.config(text="状态: 已停止", foreground="gray")
-                elif msg_type == "transcribe_log":
-                    self.transcribe_result.insert(tk.END, data + "\n")
-                    self.transcribe_result.see(tk.END)
+                if msg_type == "detect_done":
+                    self._on_detect_done(data)
+                elif msg_type == "detect_error":
+                    self._set_status(f"检测失败: {data}")
+                elif msg_type == "contacts_loaded":
+                    self._on_contacts_loaded(data)
+                elif msg_type == "contacts_error":
+                    self._set_status(f"加载联系人失败: {data}")
+                    messagebox.showerror("错误", f"加载联系人失败:\n{data}\n\n请检查「设置」中微信路径和密钥")
+                elif msg_type == "chat_loaded":
+                    self._on_chat_loaded(data)
+                    # 自动批量转写语音
+                    from src.wechat_parser.message_extractor import MSG_TYPE_VOICE
+                    voice_msgs = [m for m in data if m.type == MSG_TYPE_VOICE]
+                    if voice_msgs:
+                        self._transcribe_all_voice(data)
+                elif msg_type == "chat_error":
+                    self.chat_progress.config(text=f"加载失败: {data}")
+                elif msg_type == "transcribe_progress":
+                    self.chat_progress.config(text=data)
                 elif msg_type == "transcribe_done":
-                    self.transcribe_result.delete("1.0", tk.END)
-                    self.transcribe_result.insert(tk.END, f"引擎: {data['engine']}\n")
-                    self.transcribe_result.insert(tk.END, f"时长: {data['duration']:.1f} 秒\n")
-                    self.transcribe_result.insert(tk.END, "-" * 40 + "\n")
-                    self.transcribe_result.insert(tk.END, data["text"] + "\n")
-                    self.btn_transcribe.config(state=tk.NORMAL, text="🎙 开始转写")
+                    self.chat_progress.config(text=f"转写完成: {data['text'][:50]}...")
+                    # 刷新聊天展示
+                    if self._current_talker:
+                        self._load_chat_history(self._current_talker)
+                elif msg_type == "transcribe_all_done":
+                    self.chat_progress.config(text=f"所有语音转写完成 ({data} 条)")
+                    if self._current_talker:
+                        self._load_chat_history(self._current_talker)
                 elif msg_type == "transcribe_error":
-                    self.transcribe_result.delete("1.0", tk.END)
-                    self.transcribe_result.insert(tk.END, f"转写失败: {data}\n")
-                    self.btn_transcribe.config(state=tk.NORMAL, text="🎙 开始转写")
+                    self.chat_progress.config(text=f"转写失败: {data}")
+                elif msg_type == "analyze_progress":
+                    self.analysis_text.config(state=tk.NORMAL)
+                    self.analysis_text.delete("1.0", tk.END)
+                    self.analysis_text.insert(tk.END, data + "\n")
+                    self.analysis_text.config(state=tk.DISABLED)
+                elif msg_type == "analyze_done":
+                    self._on_analyze_done(data)
+                elif msg_type == "analyze_error":
+                    self.analysis_text.config(state=tk.NORMAL)
+                    self.analysis_text.delete("1.0", tk.END)
+                    self.analysis_text.insert(tk.END, f"分析失败:\n{data}")
+                    self.analysis_text.config(state=tk.DISABLED)
         finally:
             self.root.after(100, self._poll_queue)
 
-    def _log(self, msg: str):
-        ts = datetime.now().strftime("%H:%M:%S")
-        self.log_text.insert(tk.END, f"[{ts}] {msg}\n")
-        self.log_text.see(tk.END)
-
-    def _clear_log(self):
-        self.log_text.delete("1.0", tk.END)
-
-
-def _is_mlx_whisper_available() -> bool:
-    """检测 mlx_whisper 是否可用（精简模式打包不包含）。"""
-    try:
-        import mlx_whisper  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-def _write_crash_log(exc: Exception) -> Path | None:
-    """把崩溃异常写到 crash.log，返回路径。"""
-    import traceback
-    try:
-        crash_log = get_app_dir() / "crash.log"
-        tb = traceback.format_exc()
-        crash_log.write_text(
-            f"外贸助手崩溃 @ {datetime.now().isoformat()}\n"
-            f"Python: {sys.version}\n"
-            f"Platform: {sys.platform}\n"
-            f"{'='*60}\n{tb}",
-            encoding="utf-8",
-        )
-        return crash_log
-    except Exception:
-        return None
-
 
 def main():
+    # --mcp 模式：启动 MCP server
+    if "--mcp" in sys.argv:
+        from src.mcp_server import main as mcp_main
+        mcp_main()
+        return
     try:
         root = tk.Tk()
-        # macOS 适配
         if sys.platform == "darwin":
             try:
                 root.tk.call("::tk::unsupported::MacWindowStyle", "style",
@@ -706,13 +1040,11 @@ def main():
     except Exception as e:
         logger.error("外贸助手启动失败", exc_info=True)
         crash_log = _write_crash_log(e)
-        # 尝试弹窗显示错误（即使 tkinter 部分初始化也能用）
         try:
             from tkinter import messagebox
             err_msg = f"外贸助手启动失败:\n{e}\n\n"
             if crash_log:
-                err_msg += f"详细日志已写入:\n{crash_log}\n"
-                err_msg += f"运行日志: {get_app_dir() / 'app.log'}"
+                err_msg += f"详细日志: {crash_log}\n运行日志: {get_app_dir() / 'app.log'}"
             messagebox.showerror("外贸助手 - 启动错误", err_msg)
         except Exception:
             pass
