@@ -12,12 +12,67 @@
 3. **TODO 推进提醒**：汇总已办/待办事项，按天（或小时）提醒推进
 4. **西语 + 普通话双语**：支持各国西语口音（西班牙/墨西哥/阿根廷/哥伦比亚等）
 
+## 快速开始
+
+### 方式一：打包为桌面应用（推荐，开箱即用）
+
+```bash
+git clone https://github.com/hustlianxu/international-trade-tools.git
+cd international-trade-tools
+```
+
+**macOS**（在 Mac 上执行）：
+```bash
+bash build_mac.sh
+# 生成 dist/外贸助手.app，双击运行
+```
+
+**Windows**（在 Windows 上执行）：
+```
+双击 build_windows.bat
+# 生成 dist\TradeTools\TradeTools.exe，双击运行
+```
+
+> 详细步骤见 [docs/05-客户使用手册.md](docs/05-客户使用手册.md)
+
+### 方式二：开发模式直接运行
+
+```bash
+pip install -r requirements.txt
+python src/gui_app.py          # 启动 GUI
+# 或命令行:
+python src/main.py --mode realtime    # 准实时监听
+python src/main.py --reminder         # 生成待办提醒
+```
+
+## 配置
+
+首次运行会在用户目录自动创建配置文件：
+
+| 系统 | 路径 |
+|---|---|
+| Windows | `%APPDATA%\trade-tools\config.yaml` |
+| macOS | `~/Library/Application Support/trade-tools/config.yaml` |
+
+也可在 GUI 的「配置」页直接编辑。需填入：
+1. **微信 db_storage 路径**（微信数据目录）
+2. **DeepSeek API Key**（必须，月费<1元，[获取](https://platform.deepseek.com/)）
+3. **ASR 引擎 Key**（按引擎选一个）
+
+## 成本（月费 < 100 元，实测 1-12 元）
+
+| 方案 | ASR 引擎 | LLM | 月费（500分钟） | 适用场景 |
+|---|---|---|---|---|
+| A（推荐 Mac） | 本地 MLX Whisper medium | DeepSeek | **≈1 元** | M3 主力机，重视隐私 |
+| B（推荐 Win） | 火山豆包 ASR 2.0 | DeepSeek | **≈8 元** | 跨 Mac/Win，开箱即用 |
+| C | gpt-4o-mini-transcribe | DeepSeek | **≈12 元** | 最高准确率 |
+
 ## 技术架构
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  外贸助手业务层（本仓库）                            │
-│  客户识别 / 订单提取 / AI 摘要 / TODO 提醒           │
+│  GUI 桌面应用（Tkinter，跨平台开箱即用）              │
+│  配置页 / 准实时监听 / 语音转写 / 待办事项            │
 ├─────────────────────────────────────────────────────┤
 │  ASR 层：本地 MLX Whisper (M3) / 火山豆包 (跨平台)   │
 │  LLM 层：DeepSeek V4-Flash（月费 < 1 元）            │
@@ -31,71 +86,45 @@
 └─────────────────────────────────────────────────────┘
 ```
 
-## 成本（月费 < 100 元，实测仅需 1-12 元）
-
-| 方案 | ASR 引擎 | LLM | 月费（500分钟） | 适用场景 |
-|---|---|---|---|---|
-| A（推荐） | 本地 MLX Whisper medium | DeepSeek | **≈1 元** | M3 主力机，重视隐私 |
-| B | 火山豆包 ASR 2.0 | DeepSeek | **≈8 元** | 跨 Mac/Win，开箱即用 |
-| C | gpt-4o-mini-transcribe | DeepSeek | **≈12 元** | 最高准确率 |
-
-详见 [docs/02-语音识别方案选型.md](docs/02-语音识别方案选型.md)
-
-## 快速开始
-
-```bash
-# 安装依赖
-pip install -r requirements.txt
-
-# 复制配置
-cp src/config/config.example.yaml src/config/config.yaml
-# 编辑 config.yaml 填入 DeepSeek API Key、微信路径等
-
-# 启动（准实时模式）
-python src/main.py --mode realtime
-
-# 手动同步一次
-python src/main.py --mode manual
-
-# 仅转写某条语音
-python src/main.py --transcribe <silk文件路径>
-```
-
 ## 目录结构
 
 ```
 international-trade-tools/
-├── docs/                       # 设计文档
+├── docs/                          # 设计文档与使用手册
 │   ├── 01-系统架构设计.md
 │   ├── 02-语音识别方案选型.md
 │   ├── 03-微信数据解析方案.md
-│   └── 04-LLM需求分析设计.md
+│   ├── 04-LLM需求分析设计.md
+│   └── 05-客户使用手册.md         # ← 用户必读
 ├── src/
-│   ├── config/                 # 配置
-│   │   └── config.example.yaml
-│   ├── wechat_parser/          # 微信解析（基于 wechat-decrypt 二开）
-│   │   ├── decryptor.py        # 数据库解密
-│   │   ├── monitor.py          # 准实时监听
-│   │   ├── message_extractor.py# 消息提取
-│   │   └── silk_decoder.py     # 语音 SILK→WAV
-│   ├── asr/                    # 语音识别
-│   │   ├── base.py             # ASR 抽象接口
-│   │   ├── mlx_whisper_asr.py  # 本地 MLX Whisper（M3）
-│   │   └── volcengine_asr.py   # 火山豆包（云端）
-│   ├── llm/                    # 大模型需求分析
-│   │   └── deepseek_analyzer.py# DeepSeek 客户需求提取
-│   ├── reminder/               # TODO 提醒
-│   │   └── todo_manager.py     # 已办/待办/提醒
-│   ├── storage/                # 存储
-│   │   └── store.py            # SQLite 游标持久化
-│   └── main.py                 # 入口
+│   ├── gui_app.py                 # GUI 主应用（Tkinter）
+│   ├── main.py                    # CLI 入口
+│   ├── paths.py                   # 跨平台路径管理
+│   ├── processor.py               # 消息处理（语音→文字→分析→TODO）
+│   ├── config/                    # 配置模板
+│   ├── wechat_parser/             # 微信解析（解密/监听/提取/SILK解码）
+│   ├── asr/                       # 语音识别（MLX/火山/OpenAI）
+│   ├── llm/                       # DeepSeek 需求分析
+│   ├── reminder/                  # TODO 管理与提醒
+│   └── storage/                   # SQLite 存储
 ├── tests/
+│   └── test_core.py               # 核心逻辑单元测试（19项）
+├── trade-tools.spec               # PyInstaller 打包配置
+├── build_mac.sh                   # macOS 一键打包
+├── build_windows.bat              # Windows 一键打包
 └── requirements.txt
+```
+
+## 测试
+
+```bash
+python tests/test_core.py
+# 19 项测试覆盖：SILK解码/路径管理/存储CRUD/TODO管理/DeepSeek分析/配置加载
 ```
 
 ## ⚠️ 法律与合规
 
 - 仅可解析**本人或已获书面授权的员工**的微信数据
-- 微信数据解析工具存在被腾讯 DMCA/律师函下架风险（PyWxDump、wechat-backup 已下架），建议内部 fork 备份，不公开传播
+- 微信数据解析工具存在被腾讯 DMCA/律师函下架风险，建议内部 fork 备份，不公开传播
 - 微信 4.1.x 内存扫描已失效，需 DLL 注入方案，有封号风险，建议小号测试
-- 详见 [docs/03-微信数据解析方案.md](docs/03-微信数据解析方案.md) 风险提示章节
+- 详见 [docs/05-客户使用手册.md](docs/05-客户使用手册.md) 第 8 节
