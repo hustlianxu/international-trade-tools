@@ -22,8 +22,22 @@ pause
 exit /b 1
 
 :found_python
-echo Python: 
+echo Python:
 %PYTHON% --version
+
+REM 检查 tkinter（Microsoft Store 版 Python 可能不带，会导致打包后闪退）
+echo.
+echo 检查 tkinter...
+%PYTHON% -c "import tkinter" 2>nul
+if errorlevel 1 (
+    echo 错误: 当前 Python 缺少 tkinter 模块！打包后会闪退
+    echo 解决方案: 安装 python.org 官方 Python（自带 tkinter）
+    echo   https://www.python.org/downloads/windows/
+    echo 不要用 Microsoft Store 版本的 Python
+    pause
+    exit /b 1
+)
+echo    OK: tkinter 可用
 
 REM 清理旧构建产物
 if exist .venv rmdir /s /q .venv

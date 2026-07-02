@@ -30,9 +30,10 @@ wechat:
 
 # ═══════ 语音识别（ASR）配置 ═══════
 asr:
-  # 引擎选择：mlx_whisper（Mac M3 本地）/ volcengine（火山豆包云端）/ openai
-  # M3 推荐 mlx_whisper（0元），Windows 低配机推荐 volcengine（~7元/月）
-  engine: "mlx_whisper"
+  # 引擎选择：volcengine（火山豆包云端，跨平台）/ mlx_whisper（Mac M3 本地）/ openai
+  # 默认 volcengine：精简版打包可用（~80M），跨平台，~7元/月
+  # mlx_whisper：仅完整版打包（INCLUDE_MLX=1 bash build_mac.sh，~600M），Mac M3 免费
+  engine: "volcengine"
 
   # 本地 MLX Whisper 配置
   mlx_whisper:

@@ -27,8 +27,19 @@ class ASREngine(ABC):
 
 def create_asr(config: dict) -> ASREngine:
     """根据配置创建 ASR 引擎实例。"""
-    engine = config.get("engine", "mlx_whisper")
+    engine = config.get("engine", "volcengine")
     if engine == "mlx_whisper":
+        # 检测 mlx_whisper 是否可用（精简模式打包不含）
+        try:
+            import mlx_whisper  # noqa: F401
+        except ImportError:
+            raise RuntimeError(
+                "mlx_whisper 未安装。\n"
+                "当前为精简版打包（不含 MLX Whisper，体积约 80M）。\n"
+                "解决方案（任选其一）:\n"
+                "  1. 改用 volcengine 或 openai 引擎（在「配置」页修改）\n"
+                "  2. 重新打包完整版: INCLUDE_MLX=1 bash build_mac.sh（体积约 600M，含本地免费 ASR）"
+            )
         from .mlx_whisper_asr import MLXWhisperASR
         return MLXWhisperASR(config["mlx_whisper"])
     elif engine == "volcengine":

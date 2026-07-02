@@ -20,14 +20,51 @@ from tkinter import filedialog, messagebox, ttk
 
 import yaml
 
+
+# ═══════ 启动诊断：GUI 模式下重定向 stdout/stderr 到日志文件 ═══════
+# PyInstaller 打包后 console=False，stdout/stderr 可能丢失，导致闪退时无错误信息
+# 仅在打包模式（frozen）下重定向，开发模式保持 stdout 输出到终端
+def _setup_logging_redirect():
+    """把 stdout/stderr 重定向到用户目录的日志文件，方便诊断闪退。"""
+    is_frozen = getattr(sys, "frozen", False)
+    if is_frozen:
+        try:
+            if sys.platform == "win32":
+                base = os.environ.get("APPDATA", str(Path.home()))
+                log_dir = Path(base) / "trade-tools"
+            elif sys.platform == "darwin":
+                log_dir = Path.home() / "Library" / "Application Support" / "trade-tools"
+            else:
+                xdg = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+                log_dir = Path(xdg) / "trade-tools"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = log_dir / "app.log"
+            f = open(log_file, "a", encoding="utf-8", buffering=1)
+            f.write(f"\n{'='*60}\n外贸助手启动 @ {datetime.now().isoformat()}\n{'='*60}\n")
+            sys.stdout = f
+            sys.stderr = f
+            logging.basicConfig(
+                level=logging.INFO,
+                format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+                datefmt="%H:%M:%S",
+                stream=f,
+            )
+            return log_file
+        except Exception:
+            pass
+    # 开发模式：正常输出到终端
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    return None
+
+
+_setup_logging_redirect()
+
 from src.paths import ensure_default_config, get_app_dir, get_config_path, get_db_path
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
 logger = logging.getLogger("trade-tools-gui")
 
 
@@ -193,16 +230,23 @@ class TradeToolsApp:
         )
         ttk.Label(f, text="ASR 引擎:").grid(row=4, column=0, sticky=tk.W, padx=15, pady=3)
         self.cfg_asr_engine = tk.StringVar(value=cfg.get("asr", {}).get("engine", "volcengine"))
+        # 检测 mlx_whisper 是否可用（精简模式打包不含）
+        mlx_available = _is_mlx_whisper_available()
+        engine_values = ["volcengine", "openai"]
+        if mlx_available:
+            engine_values.append("mlx_whisper")
         engine_combo = ttk.Combobox(
             f, textvariable=self.cfg_asr_engine, width=20, state="readonly",
-            values=["volcengine", "mlx_whisper", "openai"],
+            values=engine_values,
         )
         engine_combo.grid(row=4, column=1, sticky=tk.W, pady=3)
         engine_combo.bind("<<ComboboxSelected>>", self._on_asr_engine_change)
+        if mlx_available:
+            engine_hint = "Mac M3 选 mlx_whisper(免费)\nWin 选 volcengine(~7元/月)"
+        else:
+            engine_hint = "精简版不含 MLX(用云端)\n完整版: INCLUDE_MLX=1 bash build_mac.sh"
         ttk.Label(
-            f,
-            text="Mac M3 选 mlx_whisper(免费)\nWin 选 volcengine(~7元/月)",
-            foreground="gray", justify=tk.LEFT,
+            f, text=engine_hint, foreground="gray", justify=tk.LEFT,
         ).grid(row=4, column=2, sticky=tk.W, padx=5)
 
         # 火山豆包
@@ -619,17 +663,60 @@ class TradeToolsApp:
         self.log_text.delete("1.0", tk.END)
 
 
+def _is_mlx_whisper_available() -> bool:
+    """检测 mlx_whisper 是否可用（精简模式打包不包含）。"""
+    try:
+        import mlx_whisper  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _write_crash_log(exc: Exception) -> Path | None:
+    """把崩溃异常写到 crash.log，返回路径。"""
+    import traceback
+    try:
+        crash_log = get_app_dir() / "crash.log"
+        tb = traceback.format_exc()
+        crash_log.write_text(
+            f"外贸助手崩溃 @ {datetime.now().isoformat()}\n"
+            f"Python: {sys.version}\n"
+            f"Platform: {sys.platform}\n"
+            f"{'='*60}\n{tb}",
+            encoding="utf-8",
+        )
+        return crash_log
+    except Exception:
+        return None
+
+
 def main():
-    root = tk.Tk()
-    # macOS 适配
-    if sys.platform == "darwin":
+    try:
+        root = tk.Tk()
+        # macOS 适配
+        if sys.platform == "darwin":
+            try:
+                root.tk.call("::tk::unsupported::MacWindowStyle", "style",
+                             root._w, "document", "closeBox collapseBox")
+            except Exception:
+                pass
+        app = TradeToolsApp(root)
+        logger.info("外贸助手启动成功")
+        root.mainloop()
+    except Exception as e:
+        logger.error("外贸助手启动失败", exc_info=True)
+        crash_log = _write_crash_log(e)
+        # 尝试弹窗显示错误（即使 tkinter 部分初始化也能用）
         try:
-            root.tk.call("::tk::unsupported::MacWindowStyle", "style",
-                         root._w, "document", "closeBox collapseBox")
+            from tkinter import messagebox
+            err_msg = f"外贸助手启动失败:\n{e}\n\n"
+            if crash_log:
+                err_msg += f"详细日志已写入:\n{crash_log}\n"
+                err_msg += f"运行日志: {get_app_dir() / 'app.log'}"
+            messagebox.showerror("外贸助手 - 启动错误", err_msg)
         except Exception:
             pass
-    app = TradeToolsApp(root)
-    root.mainloop()
+        sys.exit(1)
 
 
 if __name__ == "__main__":

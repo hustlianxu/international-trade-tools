@@ -22,3 +22,12 @@ venv/
 *.db-wal
 *.silk
 *.dat
+
+# PyInstaller 构建产物
+build/
+dist/
+*.spec.bak
+
+# 图标生成临时文件（icon.png 保留，icns/iconset 本地生成）
+assets/icon.iconset/
+assets/icon.icns
