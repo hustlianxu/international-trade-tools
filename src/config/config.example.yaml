@@ -74,15 +74,43 @@ asr:
     model: "gpt-4o-mini-transcribe"
 
 # ═══════ 大模型需求分析配置 ═══════
+# 支持多厂商：deepseek / openai / claude / gemini / qwen
+# - enabled 中可填多个厂商 id，启用多个后会并发分析
+# - aggregator 多厂商时可指定一个聚合厂商 id 做综合分析（空则不聚合，取首个成功结果）
 llm:
-  # DeepSeek V4-Flash：输入1元/百万tokens，输出2元/百万，月费<1元
-  provider: "deepseek"
-  deepseek:
-    api_key: ""          # 填入你的 DeepSeek API Key
-    base_url: "https://api.deepseek.com"
-    model: "deepseek-chat"
-    temperature: 0.3     # 业务理解需稳定，偏低
-    max_tokens: 2000
+  enabled: ["deepseek"]        # 启用的厂商列表，可多选
+  aggregator: ""               # 多厂商时可选指定聚合厂商，空则不聚合
+  providers:
+    # DeepSeek V4-Flash：输入1元/百万tokens，输出2元/百万，月费<1元
+    deepseek:
+      api_key: ""          # 填入你的 DeepSeek API Key
+      base_url: "https://api.deepseek.com"
+      model: "deepseek-chat"
+      temperature: 0.3     # 业务理解需稳定，偏低
+      max_tokens: 2000
+    # OpenAI GPT 系列（兼容接口）
+    openai:
+      api_key: ""
+      base_url: "https://api.openai.com/v1"
+      model: "gpt-4o-mini"
+      temperature: 0.3
+      max_tokens: 2000
+    # Anthropic Claude（messages API）
+    claude:
+      api_key: ""
+      model: "claude-3-5-haiku-latest"
+      max_tokens: 2000
+    # Google Gemini
+    gemini:
+      api_key: ""
+      model: "gemini-1.5-flash"
+    # 阿里通义千问（DashScope OpenAI 兼容模式）
+    qwen:
+      api_key: ""
+      base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+      model: "qwen-plus"
+      temperature: 0.3
+      max_tokens: 2000
 
 # ═══════ TODO 提醒配置 ═══════
 reminder:

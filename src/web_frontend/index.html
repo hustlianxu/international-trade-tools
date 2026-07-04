@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>外贸助手 · 微信 AI 客户管理</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app">
+  <!-- 顶部标题栏 -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="logo">◆</span>
+      <h1 class="title">外贸助手</h1>
+      <span class="subtitle">微信 AI 客户管理</span>
+    </div>
+    <div class="topbar-right">
+      <button class="btn-ghost" onclick="App.openSettings()">设置</button>
+      <button class="btn-ghost" onclick="App.openTodos()">待办</button>
+      <button class="btn-ghost" onclick="App.openMcpInfo()">MCP</button>
+      <button class="btn-ghost" onclick="App.quitApp()">退出</button>
+    </div>
+  </header>
+
+  <!-- 主体三栏 -->
+  <main class="main">
+    <!-- 左栏：会话列表 -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <h2>会话</h2>
+        <button class="btn-icon" title="刷新联系人" onclick="App.loadContacts()">↻</button>
+      </div>
+      <div class="search-box">
+        <input type="text" id="search-input" placeholder="搜索联系人..." oninput="App.filterContacts()">
+      </div>
+      <div class="contact-list" id="contact-list">
+        <div class="empty-hint">点击 ↻ 加载联系人</div>
+      </div>
+    </aside>
+
+    <!-- 中栏：聊天内容 -->
+    <section class="chat-panel">
+      <div class="chat-header">
+        <span id="chat-title" class="chat-title">选择左侧联系人查看聊天</span>
+        <div class="chat-actions">
+          <select id="time-filter" onchange="App.reloadChat()">
+            <option value="">全部时间</option>
+            <option value="1d">近一天</option>
+            <option value="7d">近一周</option>
+            <option value="30d">近一月</option>
+          </select>
+        </div>
+      </div>
+      <div class="chat-messages" id="chat-messages">
+        <div class="empty-hint">选择联系人后显示聊天记录</div>
+      </div>
+    </section>
+
+    <!-- 右栏：AI 分析 -->
+    <aside class="analysis-panel">
+      <div class="analysis-header">
+        <h2>AI 分析</h2>
+        <button class="btn-primary btn-sm" id="analyze-btn" onclick="App.analyzeCurrent()" disabled>分析</button>
+      </div>
+      <div class="analysis-content" id="analysis-content">
+        <div class="empty-hint">选择联系人并点击「分析」</div>
+      </div>
+    </aside>
+  </main>
+
+  <!-- 底部状态栏 -->
+  <footer class="statusbar">
+    <span id="status-left" class="status-item">正在检测微信...</span>
+    <span id="status-center" class="status-item">微信版本检测中...</span>
+    <span id="status-right" class="status-item">ASR: 未配置</span>
+  </footer>
+</div>
+
+<!-- 设置弹窗 -->
+<div class="modal-overlay" id="settings-modal" style="display:none;">
+  <div class="modal">
+    <div class="modal-header">
+      <h2>设置</h2>
+      <button class="btn-icon" onclick="App.closeSettings()">✕</button>
+    </div>
+    <div class="modal-tabs">
+      <button class="tab active" data-tab="wechat" onclick="App.switchTab('wechat')">微信</button>
+      <button class="tab" data-tab="keys" onclick="App.switchTab('keys')">密钥</button>
+      <button class="tab" data-tab="asr" onclick="App.switchTab('asr')">ASR</button>
+      <button class="tab" data-tab="llm" onclick="App.switchTab('llm')">大模型</button>
+    </div>
+    <div class="modal-body">
+      <!-- 微信 tab -->
+      <div class="tab-pane active" id="tab-wechat">
+        <div class="form-row">
+          <label>微信数据目录</label>
+          <div class="input-group">
+            <input type="text" id="cfg-db-path" placeholder="自动检测或手动填写 db_storage 路径">
+            <button class="btn-secondary btn-sm" onclick="App.detectWechat()">自动检测</button>
+          </div>
+          <p class="hint">Mac: ~/Library/Containers/.../xwechat_files/&lt;wxid&gt;/db_storage</p>
+        </div>
+        <div class="form-row">
+          <label>微信进程名</label>
+          <input type="text" id="cfg-process-name" placeholder="WeChat.exe / 微信 / wechat">
+        </div>
+      </div>
+
+      <!-- 密钥 tab -->
+      <div class="tab-pane" id="tab-keys">
+        <div class="version-info" id="key-version-info"></div>
+        <div class="key-section">
+          <h3>方式 1 · 加载 all_keys.json（推荐）</h3>
+          <p class="hint">由 wechat-decrypt 工具导出的批量密钥文件，按 salt 自动匹配每个 .db</p>
+          <div class="input-group">
+            <input type="text" id="cfg-keys-json" placeholder="选择 all_keys.json 文件路径">
+            <button class="btn-secondary btn-sm" onclick="App.loadKeysJson()">加载</button>
+          </div>
+        </div>
+        <div class="key-section">
+          <h3>方式 2 · 自动内存扫描</h3>
+          <p class="hint">Mac 需输入 root 密码（osascript 提权）；4.1+ 内存扫描已失效，请用方式 1</p>
+          <button class="btn-primary" onclick="App.scanKeys()">立即扫描</button>
+          <span class="result-hint" id="scan-result"></span>
+        </div>
+        <div class="key-section">
+          <h3>方式 3 · 手动 raw key</h3>
+          <p class="hint">96 字符 hex（enc_key 64 + salt 32）</p>
+          <div class="input-group">
+            <input type="text" id="cfg-raw-key" placeholder="x'...96hex...' 或纯 96hex">
+            <button class="btn-secondary btn-sm" onclick="App.setRawKey()">保存</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ASR tab -->
+      <div class="tab-pane" id="tab-asr">
+        <div class="form-row">
+          <label>ASR 引擎</label>
+          <select id="cfg-asr-engine" onchange="App.renderAsrFields()">
+            <option value="volcengine">火山引擎豆包</option>
+            <option value="mlx_whisper">MLX Whisper（Mac 本地）</option>
+            <option value="openai">OpenAI</option>
+          </select>
+        </div>
+        <div id="asr-fields"></div>
+      </div>
+
+      <!-- 大模型 tab -->
+      <div class="tab-pane" id="tab-llm">
+        <div class="form-row">
+          <label>启用厂商（可多选）</label>
+          <div class="checkbox-group" id="llm-enabled"></div>
+        </div>
+        <div class="form-row" id="aggregator-row" style="display:none;">
+          <label>聚合厂商（综合分析）</label>
+          <select id="cfg-aggregator">
+            <option value="">不聚合（取首个成功结果）</option>
+          </select>
+          <p class="hint">启用多个厂商时，可选一个做综合分析</p>
+        </div>
+        <div id="llm-providers"></div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" onclick="App.closeSettings()">取消</button>
+      <button class="btn-primary" onclick="App.saveSettings()">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 待办弹窗 -->
+<div class="modal-overlay" id="todos-modal" style="display:none;">
+  <div class="modal modal-sm">
+    <div class="modal-header">
+      <h2>待办事项</h2>
+      <button class="btn-icon" onclick="App.closeTodos()">✕</button>
+    </div>
+    <div class="modal-body" id="todos-body"></div>
+  </div>
+</div>
+
+<!-- MCP 信息弹窗 -->
+<div class="modal-overlay" id="mcp-modal" style="display:none;">
+  <div class="modal modal-sm">
+    <div class="modal-header">
+      <h2>MCP Server</h2>
+      <button class="btn-icon" onclick="App.closeMcpInfo()">✕</button>
+    </div>
+    <div class="modal-body">
+      <p>通过 stdio JSON-RPC 2.0 协议让外部 AI 客户端查询微信聊天记录。</p>
+      <pre id="mcp-info"></pre>
+    </div>
+  </div>
+</div>
+
+<!-- Toast 提示 -->
+<div class="toast" id="toast" style="display:none;"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

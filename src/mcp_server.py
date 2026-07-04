@@ -401,18 +401,21 @@ class MCPServer:
         return self._asr_engine
 
     def _get_analyzer(self):
-        """获取 DeepSeekAnalyzer 实例。"""
+        """获取 LLM 分析器实例（支持多厂商）。"""
         if self._analyzer is None:
             with self._init_lock:
                 if self._analyzer is None:
-                    from src.llm.deepseek_analyzer import DeepSeekAnalyzer
-                    cfg = self.config.get("llm", {}).get("deepseek", {})
-                    if not cfg.get("api_key"):
+                    from src.llm import create_analyzer
+                    llm_cfg = self.config.get("llm", {})
+                    if not llm_cfg:
+                        raise RuntimeError("LLM 配置缺失，无法执行 AI 分析。")
+                    try:
+                        self._analyzer = create_analyzer(llm_cfg)
+                    except ValueError as e:
                         raise RuntimeError(
-                            "DeepSeek API Key 未配置，无法执行 AI 分析。"
-                            "请在「配置」页填写 API Key。"
-                        )
-                    self._analyzer = DeepSeekAnalyzer(cfg)
+                            f"至少一个启用厂商需配置 api_key。{e} "
+                            "请在「配置」页填写对应厂商的 API Key。"
+                        ) from e
         return self._analyzer
 
     # ──────── 工具实现 ────────
@@ -672,7 +675,7 @@ class MCPServer:
 - 若查询未明确时间范围，time_from 和 time_to 都返回空字符串
 """
         try:
-            raw = analyzer._call_deepseek(system_prompt, user_prompt)
+            raw = analyzer.chat(system_prompt, user_prompt, json_mode=True)
             params = json.loads(raw)
         except (json.JSONDecodeError, Exception) as e:
             logger.warning("[MCP] 自然语言解析失败，回退为直接关键词搜索: %s", e)

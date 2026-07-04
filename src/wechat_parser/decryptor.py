@@ -189,16 +189,26 @@ class WeChatKeyStore:
 
         格式：{"rel/path.db": {"enc_key": "64hex"}, ...}
         salt 从对应 .db 文件读取（与 wechat-decrypt 一致，更可靠）。
+
+        路径容错：Mac 微信检测可能返回 user_dir 而非 user_dir/db_storage，
+        若 db_storage_path/rel 找不到文件，自动尝试 db_storage_path/db_storage/rel。
         """
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        store = cls(db_storage_path)
+        db_base = Path(db_storage_path)
+        # 自动探测真实 db_storage 根：若 db_base 下无 .db 但 db_base/db_storage 有，则用后者
+        if not any(db_base.rglob("*.db")):
+            sub = db_base / "db_storage"
+            if sub.exists() and any(sub.rglob("*.db")):
+                db_base = sub
+                logger.info("[KeyStore] 自动修正 db_storage 路径: %s", db_base)
+        store = cls(db_base)
         for rel, info in data.items():
             if rel.startswith("_"):
                 continue  # 跳过元数据字段
             enc_key = info.get("enc_key") if isinstance(info, dict) else info
             if not enc_key or len(enc_key) != 64:
                 continue
-            db_file = Path(db_storage_path) / rel
+            db_file = db_base / rel
             if not db_file.exists():
                 logger.debug("[KeyStore] all_keys.json 引用的 db 不存在: %s", rel)
                 continue
@@ -207,6 +217,8 @@ class WeChatKeyStore:
             except OSError:
                 continue
             store.add_key(enc_key, salt.hex(), db_rel_path=rel)
+        # 交叉验证补全未直接匹配的 db
+        store.match_to_dbs()
         logger.info("[KeyStore] 从 %s 加载 %d 个密钥", path, len(store._by_salt))
         return store
 
@@ -385,6 +397,7 @@ def _scan_keys_macos_mach(pid: int) -> list[tuple[str, str]]:
     kern_return_t = ctypes.c_int
     mach_vm_address_t = ctypes.c_uint64
     mach_vm_size_t = ctypes.c_uint64
+    mach_msg_type_number_t = ctypes.c_uint32  # mach_vm_read 的 count_out 是 4 字节
     natural_t = ctypes.c_uint
     integer_t = ctypes.c_int
     KERN_SUCCESS = 0
@@ -423,19 +436,23 @@ def _scan_keys_macos_mach(pid: int) -> list[tuple[str, str]]:
     libc.mach_vm_region.restype = kern_return_t
 
     # mach_vm_read(task, addr, size, pointer_out, count_out)
+    # 注意：count_out 是 mach_msg_type_number_t*（unsigned int, 4字节），
+    # 不是 mach_vm_size_t*（8字节）。错类型会导致未定义行为。
     libc.mach_vm_read.argtypes = [
         mach_port_t,
         mach_vm_address_t,
         mach_vm_size_t,
         ctypes.POINTER(ctypes.c_void_p),
-        ctypes.POINTER(mach_vm_size_t),
+        ctypes.POINTER(mach_msg_type_number_t),
     ]
     libc.mach_vm_read.restype = kern_return_t
 
     libc.mach_vm_deallocate.argtypes = [mach_port_t, ctypes.c_void_p, mach_vm_size_t]
     libc.mach_vm_deallocate.restype = kern_return_t
 
-    mach_self = libc.mach_task_self()
+    # ⚠️ mach_task_self() 在 macOS 是宏，展开为全局变量 mach_task_self_，
+    # 不是函数。若用 libc.mach_task_self() 调用会把变量地址当函数跳转 → SIGSEGV。
+    mach_self = ctypes.c_uint.in_dll(libc, "mach_task_self_").value
 
     # 1) task_for_pid
     task = mach_port_t(0)
@@ -457,6 +474,8 @@ def _scan_keys_macos_mach(pid: int) -> list[tuple[str, str]]:
     obj_name = mach_port_t(0)
 
     hex_re = re.compile(rb"x'([0-9a-fA-F]{96})'")
+    # x'<96hex>' 模式最长 101 字节，分块边界需重叠此长度以防漏扫
+    _OVERLAP = 101
 
     while True:
         kr = libc.mach_vm_region(task, ctypes.byref(addr), ctypes.byref(size),
@@ -464,6 +483,11 @@ def _scan_keys_macos_mach(pid: int) -> list[tuple[str, str]]:
                                  ctypes.byref(count), ctypes.byref(obj_name))
         if kr != KERN_SUCCESS:
             break  # 枚举结束
+
+        # size==0 守护：避免无限循环（对齐 find_all_keys_macos.c 第 190 行）
+        if size.value == 0:
+            addr.value += 1
+            continue
 
         # 只扫描可读可写区域（与 wechat-decrypt 一致）
         if not (info.protection & VM_PROT_READ and info.protection & VM_PROT_WRITE):
@@ -477,7 +501,8 @@ def _scan_keys_macos_mach(pid: int) -> list[tuple[str, str]]:
         while off < region_end:
             chunk_size = min(_CHUNK_SIZE, region_end - off)
             data_ptr = ctypes.c_void_p(0)
-            data_size = mach_vm_size_t(0)
+            # count_out 用 mach_msg_type_number_t（4字节），不是 mach_vm_size_t
+            data_size = mach_msg_type_number_t(0)
             kr = libc.mach_vm_read(task, off, chunk_size,
                                    ctypes.byref(data_ptr), ctypes.byref(data_size))
             if kr != KERN_SUCCESS or not data_ptr.value or data_size.value == 0:
@@ -499,7 +524,9 @@ def _scan_keys_macos_mach(pid: int) -> list[tuple[str, str]]:
                 keys.append((enc_key, salt))
                 if len(keys) >= _MAX_KEYS:
                     return keys
-            off += chunk_size
+            # 重叠推进：回退 _OVERLAP 字节，确保跨块边界的密钥模式被捕获
+            advance = chunk_size - _OVERLAP if chunk_size > _OVERLAP else chunk_size
+            off += advance
         addr.value = region_end
 
     return keys
@@ -571,7 +598,13 @@ def scan_keys_macos_with_sudo_dialog(
         匹配好 .db 的 KeyStore
     """
     db_storage_path = str(Path(db_storage_path).resolve())
-    python_exe = sys.executable or "python3"
+    # 打包模式下 sys.executable 是 .app 二进制（无法执行 .py），改用系统 Python；
+    # 扫描脚本只用 stdlib（ctypes/hashlib/hmac/struct/re），/usr/bin/python3 足够。
+    # 开发模式用 sys.executable（有完整依赖）。
+    if getattr(sys, "frozen", False):
+        python_exe = "/usr/bin/python3"
+    else:
+        python_exe = sys.executable or "python3"
 
     # 内联扫描脚本（独立运行，sudo 上下文）
     scan_script = f'''
@@ -601,9 +634,10 @@ except Exception as e:
     try:
         # osascript 弹窗 + sudo 执行
         # 用 with administrator privileges 会弹系统密码框
+        # 路径用单引号包裹，避免空格（macOS "Application Support"）被截断
         apple = (
-            f'do shell script "{python_exe} {script_path} 2>&1" '
-            f'with administrator privileges'
+            f"do shell script \"{python_exe} '{script_path}' 2>&1\" "
+            f"with administrator privileges"
         )
         cmd = ["osascript", "-e", apple]
         logger.info("[sudo] 弹出系统授权对话框，等待用户输入 root 密码...")

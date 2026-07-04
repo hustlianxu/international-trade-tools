@@ -24,37 +24,8 @@ if [ -z "$PYTHON" ]; then
 fi
 echo "Python: $($PYTHON --version)"
 
-# ─── 关键检查：tkinter ───
-# Mac 上 Homebrew/pyenv 安装的 Python 经常不带 tkinter，会导致打包后 .app 闪退
-echo ""
-echo "检查 tkinter..."
-if ! $PYTHON -c "import tkinter" 2>/dev/null; then
-    echo "═══════════════════════════════════════════════════════════"
-    echo "错误: 当前 Python 缺少 tkinter 模块！"
-    echo "  打包后的 .app 会闪退（报 ModuleNotFoundError: No module named 'tkinter'）"
-    echo ""
-    echo "原因: Homebrew / pyenv 安装的 Python 默认不带 tkinter"
-    echo ""
-    echo "解决方案（任选其一）:"
-    echo "  方案A（推荐，最简单）: 安装 python.org 官方 Python"
-    echo "    1. 访问 https://www.python.org/downloads/macos/"
-    echo "    2. 下载 Python 3.11 或 3.12 的 macOS 64-bit universal2 installer"
-    echo "    3. 安装后用 /Library/Frameworks/Python.framework/Versions/3.11/bin/python3.11"
-    echo "    4. 重新运行本脚本"
-    echo ""
-    echo "  方案B: Homebrew 用户安装 tcl-tk 并重装 python"
-    echo "    brew install tcl-tk"
-    echo "    brew uninstall python@3.11"
-    echo "    brew install python-tk@3.11"
-    echo "    brew install python@3.11"
-    echo ""
-    echo "  方案C: pyenv 用户编译时带 tcl-tk"
-    echo "    brew install tcl-tk"
-    echo "    env PYTHON_CONFIGURE_OPTS=\"--with-tcl-tk\" pyenv install 3.11.9"
-    echo "═══════════════════════════════════════════════════════════"
-    exit 1
-fi
-echo "  ✓ tkinter 可用"
+# ─── Web UI 不再依赖 tkinter，跳过 tkinter 检查 ───
+# 旧版 tkinter GUI 已替换为 HTML/CSS/JS Web UI（src/web_app.py）
 
 # 检查架构
 ARCH=$(uname -m)
@@ -129,7 +100,6 @@ fi
 # 验证关键依赖
 echo ""
 echo "4. 验证依赖..."
-python -c "import tkinter; print('   ✓ tkinter 可用')" 2>/dev/null || echo "   ✗ tkinter 不可用（打包后必崩！）"
 python -c "import pysilk; print('   ✓ pysilk-mod 可用')" 2>/dev/null || echo "   ✗ pysilk-mod 未安装（语音转写将不可用）"
 python -c "import zstandard; print('   ✓ zstandard 可用')" 2>/dev/null || echo "   ✗ zstandard 未安装"
 python -c "from Crypto.Cipher import AES; print('   ✓ pycryptodome 可用')" 2>/dev/null || echo "   ✗ pycryptodome 未安装"

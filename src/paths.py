@@ -76,7 +76,9 @@ def ensure_default_config():
         config_path.write_text(
             'wechat:\n  db_storage_path: ""\n  process_name: "WeChat.exe"\n'
             'asr:\n  engine: "volcengine"\n  volcengine:\n    app_id: ""\n    access_token: ""\n'
-            'llm:\n  deepseek:\n    api_key: ""\nstorage:\n  db_path: ""\n',
+            'llm:\n  enabled: ["deepseek"]\n  aggregator: ""\n'
+            '  providers:\n    deepseek:\n      api_key: ""\n      base_url: "https://api.deepseek.com"\n'
+            '      model: "deepseek-chat"\nstorage:\n  db_path: ""\n',
             encoding="utf-8",
         )
     return config_path

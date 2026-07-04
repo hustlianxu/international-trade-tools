@@ -67,7 +67,7 @@ def process_voice_message(msg, asr_engine, store, tmp_dir="./tmp"):
 
 
 def handle_new_messages(talker, messages, asr_engine, analyzer, todo_mgr, store):
-    """处理新消息的回调：语音转文字 → DeepSeek 分析 → 写 TODO。"""
+    """处理新消息的回调：语音转文字 → LLM 分析 → 写 TODO。"""
     from src.wechat_parser.message_extractor import MSG_TYPE_TEXT, MSG_TYPE_VOICE
 
     dialog_messages = []
@@ -105,7 +105,7 @@ def handle_new_messages(talker, messages, asr_engine, analyzer, todo_mgr, store)
 def run_realtime(config):
     """准实时监听模式。"""
     from src.asr.base import create_asr
-    from src.llm.deepseek_analyzer import DeepSeekAnalyzer
+    from src.llm import create_analyzer
     from src.reminder.todo_manager import TodoManager
     from src.storage.store import Store
     from src.wechat_parser.decryptor import get_key_store
@@ -114,11 +114,11 @@ def run_realtime(config):
     wechat_cfg = config["wechat"]
     store = Store(config["storage"]["db_path"])
     asr_engine = create_asr(config["asr"])
-    analyzer = DeepSeekAnalyzer(config["llm"]["deepseek"])
+    analyzer = create_analyzer(config["llm"])
     todo_mgr = TodoManager(store)
 
     logger.info("=== 外贸助手 - 准实时模式 ===")
-    logger.info("ASR 引擎: %s | LLM: DeepSeek", asr_engine.name())
+    logger.info("ASR 引擎: %s | LLM: %s", asr_engine.name(), analyzer.name())
 
     # 1. 获取微信密钥存储（按优先级：all_keys.json → 手动 raw_key → 自动扫描）
     #    CLI 模式不弹窗提权，需已 sudo 运行或预先加载 all_keys.json

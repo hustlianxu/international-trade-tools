@@ -216,8 +216,14 @@ class TradeToolsApp:
 
     def _get_analyzer(self):
         if self._analyzer is None:
-            from src.llm.deepseek_analyzer import DeepSeekAnalyzer
-            self._analyzer = DeepSeekAnalyzer(self.config["llm"]["deepseek"])
+            from src.llm import create_analyzer
+            try:
+                self._analyzer = create_analyzer(self.config.get("llm", {}))
+            except Exception as e:
+                # 配置缺失或厂商不可用时返回 None，避免阻塞 GUI 启动；
+                # 实际调用方会在使用 analyzer 前判空。
+                logger.warning("LLM 分析器初始化失败: %s", e)
+                return None
         return self._analyzer
 
     def _get_todo_mgr(self):

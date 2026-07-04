@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional
 
-from src.llm.deepseek_analyzer import AnalysisResult
+from src.llm.base import AnalysisResult
 
 logger = logging.getLogger(__name__)
 

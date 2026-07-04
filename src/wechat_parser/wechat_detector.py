@@ -106,40 +106,95 @@ def _detect_windows() -> WeChatDetection:
     return result
 
 
+def _resolve_real_home() -> Path:
+    """sudo 运行时 HOME 会变成 /var/root，需通过 SUDO_USER 回真实用户家目录。
+
+    对齐 wechat-decrypt config.py::_auto_detect_db_dir_macos / find_all_keys_macos.c
+    的 SUDO_USER 处理逻辑。
+    """
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        try:
+            import pwd
+            pw = pwd.getpwnam(sudo_user)
+            if pw.pw_dir:
+                return Path(pw.pw_dir)
+        except (KeyError, OSError):
+            pass
+    return Path.home()
+
+
+def _has_db_files(db_storage: Path) -> bool:
+    """判断目录是否真的含 .db 文件（避免误报空目录）。"""
+    try:
+        return any(db_storage.rglob("*.db"))
+    except OSError:
+        return False
+
+
 def _detect_macos() -> WeChatDetection:
-    """macOS 检测：扫描 Containers 目录。"""
+    """macOS 检测：对齐 wechat-decrypt 的目录探测逻辑。
+
+    wechat-decrypt（4.x 标准）使用：
+        ~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/<wxid>/db_storage
+
+    旧版微信 Mac 布局（部分 4.0 早期版本）：
+        ~/Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/
+            com.tencent.xinWeChat/<version>/<user_hash>/db_storage
+
+    两者都扫描，返回的 path 始终是 db_storage 子目录（含 .db 文件），
+    这样 all_keys.json 的 "message/message_0.db" 相对路径才能正确解析。
+    """
     result = WeChatDetection(process_name="微信")
-    home = Path.home()
-    # 微信 4.x Mac 版数据目录
-    search_roots = [
-        home / "Library" / "Containers" / "com.tencent.xinWeChat" / "Data" / "Library" / "Application Support" / "com.tencent.xinWeChat",
+    home = _resolve_real_home()
+
+    # ── 路径1（wechat-decrypt 标准，4.x 推荐）：Data/Documents/xwechat_files ──
+    xwechat_root = (home / "Library" / "Containers" / "com.tencent.xinWeChat"
+                    / "Data" / "Documents" / "xwechat_files")
+    if xwechat_root.exists():
+        # 每个子目录是 <wxid>_<hash> 或 <wxid>，下有 db_storage
+        for user_dir in sorted(xwechat_root.iterdir(), reverse=True):
+            if not user_dir.is_dir() or user_dir.name.startswith("."):
+                continue
+            db_storage = user_dir / "db_storage"
+            if db_storage.exists() and _has_db_files(db_storage):
+                wxid_hash = user_dir.name
+                wxid = wxid_hash.split("_")[0] if "_" in wxid_hash else wxid_hash
+                result.candidates.append({
+                    "path": str(db_storage),  # 始终返回 db_storage 子目录
+                    "wxid": wxid,
+                    "label": f"{wxid} ({user_dir.name})",
+                    "version": "",
+                })
+
+    # ── 路径2（旧版 4.0 早期）：Application Support/<version>/<hash>/db_storage ──
+    legacy_roots = [
+        home / "Library" / "Containers" / "com.tencent.xinWeChat" / "Data" / "Library"
+        / "Application Support" / "com.tencent.xinWeChat",
         home / "Library" / "Application Support" / "com.tencent.xinWeChat",
     ]
-
-    for root in search_roots:
+    for root in legacy_roots:
         if not root.exists():
             continue
-        # 微信 4.x Mac: <version>/<user_hash>/Message/
         for version_dir in sorted(root.iterdir(), reverse=True):
-            if not version_dir.is_dir():
+            if not version_dir.is_dir() or version_dir.name.startswith("."):
                 continue
-            result.version = version_dir.name
             for user_dir in sorted(version_dir.iterdir()):
-                if not user_dir.is_dir():
+                if not user_dir.is_dir() or user_dir.name.startswith("."):
                     continue
-                # db_storage 或 Message 目录
                 db_storage = user_dir / "db_storage"
                 if not db_storage.exists():
-                    db_storage = user_dir / "Message"
-                if db_storage.exists():
+                    db_storage = user_dir / "Message"  # 更早版本
+                if db_storage.exists() and _has_db_files(db_storage):
                     result.candidates.append({
-                        "path": str(user_dir),
+                        "path": str(db_storage),  # 始终返回 db_storage 子目录
                         "wxid": user_dir.name,
                         "label": f"{user_dir.name} (微信 {version_dir.name})",
                         "version": version_dir.name,
                     })
 
     if result.candidates:
+        # 按 db_storage 目录 mtime 降序，优先最近活跃账号
         result.candidates.sort(key=lambda x: Path(x["path"]).stat().st_mtime, reverse=True)
         best = result.candidates[0]
         result.found = True

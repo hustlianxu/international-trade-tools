@@ -120,7 +120,7 @@ class Store:
     # ═══════ 分析结果 ═══════
     def save_analysis(self, result):
         """保存 AnalysisResult。"""
-        from src.llm.deepseek_analyzer import AnalysisResult
+        from src.llm.base import AnalysisResult
         needs_json = json.dumps([{
             "category": n.category, "summary": n.summary, "product": n.product,
             "quantity": n.quantity, "deadline": n.deadline, "urgency": n.urgency,

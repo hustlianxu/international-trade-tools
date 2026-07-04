@@ -1,4 +1,4 @@
-"""消息处理器：语音转文字 → DeepSeek 分析 → 写 TODO。
+"""消息处理器：语音转文字 → LLM 分析 → 写 TODO。
 
 从 main.py 提取，供 CLI 和 GUI 共用。
 """
@@ -52,13 +52,13 @@ def process_voice_message(msg, asr_engine, store):
 
 
 def handle_new_messages(talker, messages, asr_engine, analyzer, todo_mgr, store):
-    """处理新消息回调：语音转文字 → DeepSeek 分析 → 写 TODO。
+    """处理新消息回调：语音转文字 → LLM 分析 → 写 TODO。
 
     Args:
         talker: 客户 wxid
         messages: WeChatMessage 列表
         asr_engine: ASR 引擎
-        analyzer: DeepSeekAnalyzer 实例
+        analyzer: LLMEngine 实例
         todo_mgr: TodoManager 实例
         store: Store 实例
 

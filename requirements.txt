@@ -17,7 +17,9 @@ pysilk-mod>=1.6.4; sys_platform != "win32"  # macOS/Linux 用
 requests>=2.31                # HTTP 调用火山豆包/OpenAI API
 
 # 大模型
-openai>=1.40                  # DeepSeek 兼容 OpenAI SDK
+openai>=1.40                  # DeepSeek/OpenAI/Qwen(DashScope兼容模式) 共用 OpenAI SDK
+anthropic>=0.40               # Claude（messages API）
+google-generativeai>=0.7      # Google Gemini
 
 # 存储与工具
 pyyaml>=6.0                   # 配置文件

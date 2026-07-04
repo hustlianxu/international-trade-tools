@@ -13,9 +13,12 @@ block_cipher = None
 
 PROJECT_ROOT = Path(".").resolve()
 
-# 数据文件：配置模板
+# 数据文件：配置模板 + Web 前端
 datas = [
     ("src/config/config.example.yaml", "src/config"),
+    ("src/web_frontend/index.html", "src/web_frontend"),
+    ("src/web_frontend/style.css", "src/web_frontend"),
+    ("src/web_frontend/app.js", "src/web_frontend"),
 ]
 # 图标（如已生成）
 icon_path = None
@@ -30,6 +33,8 @@ hiddenimports = [
     "zstandard",
     "psutil",
     "openai",
+    "anthropic",
+    "google.generativeai",
     "apscheduler",
     "pysilk",
     "wave",
@@ -79,7 +84,7 @@ if sys.platform == "win32":
     excludes += ["mlx", "mlx_whisper"]
 
 a = Analysis(
-    ["src/gui_app.py"],
+    ["src/web_app.py"],
     pathex=[str(PROJECT_ROOT)],  # 项目根，确保 from src.xxx import 可解析
     binaries=[],
     datas=datas,
