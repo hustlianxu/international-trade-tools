@@ -114,7 +114,8 @@
           <h3>方式 1 · 加载 all_keys.json（推荐）</h3>
           <p class="hint">由 wechat-decrypt 工具导出的批量密钥文件，按 salt 自动匹配每个 .db</p>
           <div class="input-group">
-            <input type="text" id="cfg-keys-json" placeholder="选择 all_keys.json 文件路径">
+            <input type="text" id="cfg-keys-json" placeholder="选择 all_keys.json 文件路径" readonly>
+            <button class="btn-secondary btn-sm" onclick="App.pickKeysJson()">选择文件</button>
             <button class="btn-secondary btn-sm" onclick="App.loadKeysJson()">加载</button>
           </div>
         </div>

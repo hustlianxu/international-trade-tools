@@ -21,6 +21,7 @@ API 路由：
     POST /api/keys/scan         内存扫描（macOS osascript 提权）
     POST /api/keys/load_json    加载 all_keys.json {path}
     POST /api/keys/raw          设置手动 raw_key {raw_key}
+    POST /api/pick_file         弹出系统文件选择器 {prompt, file_type}
     GET  /api/todos             待办列表
     POST /api/todos/<id>/done   标记待办完成
 """
@@ -193,6 +194,60 @@ class WebBackend:
         self.reset_components()
         return {"ok": True}
 
+    def pick_file(self, prompt: str = "选择文件", file_type: str = "json") -> dict:
+        """弹出系统原生文件选择对话框，返回选中文件路径。
+
+        macOS 用 osascript `choose file`（无需任何 Python GUI 依赖，打包友好）；
+        Windows/Linux 用 tkinter.filedialog（stdlib）作回退。
+        用户取消时返回 {"ok": True, "path": ""}。
+        """
+        import sys
+        import subprocess
+
+        if sys.platform == "darwin":
+            # osascript 原生文件选择器，无 Python GUI 依赖
+            # 不限定 type（json UTI 不稳定），仅用 prompt 提示
+            apple = (
+                f'POSIX path of (choose file with prompt "{prompt}" '
+                f'without invisibles)'
+            )
+            try:
+                r = subprocess.run(
+                    ["osascript", "-e", apple],
+                    capture_output=True, text=True, timeout=600,
+                )
+            except subprocess.SubprocessError as e:
+                return {"ok": False, "error": f"文件选择器异常: {e}"}
+            if r.returncode != 0:
+                err = (r.stderr or "").strip()
+                # -128 = 用户取消
+                if "-128" in err or "User canceled" in err:
+                    return {"ok": True, "path": ""}
+                return {"ok": False, "error": f"文件选择器失败: {err}"}
+            path = r.stdout.strip()
+            # 去掉 osascript 可能的转义
+            if path.startswith('"') and path.endswith('"'):
+                path = path[1:-1]
+            return {"ok": True, "path": path}
+
+        # Windows / Linux: 用 tkinter（stdlib）
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+        except ImportError:
+            return {"ok": False, "error": "当前系统无可用文件选择器（tkinter 未安装）"}
+
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            filetypes = [(file_type.upper() + " 文件", "*." + file_type), ("所有文件", "*.*")]
+            path = filedialog.askopenfilename(title=prompt, filetypes=filetypes)
+            root.destroy()
+            return {"ok": True, "path": path or ""}
+        except Exception as e:
+            return {"ok": False, "error": f"文件选择器异常: {e}"}
+
     # ─── 待办 ───
     def list_todos(self) -> dict:
         store = self.mcp._get_store()
@@ -315,6 +370,11 @@ def make_handler(backend: WebBackend):
                 self._ok(backend.load_keys_json(body.get("path", "")))
             elif path == "/api/keys/raw":
                 self._ok(backend.set_raw_key(body.get("raw_key", "")))
+            elif path == "/api/pick_file":
+                self._ok(backend.pick_file(
+                    prompt=body.get("prompt", "选择文件"),
+                    file_type=body.get("file_type", "json"),
+                ))
             elif path.startswith("/api/todos/") and path.endswith("/done"):
                 todo_id = path[len("/api/todos/"):-len("/done")]
                 self._ok(backend.done_todo(todo_id))

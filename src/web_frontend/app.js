@@ -279,7 +279,7 @@ const App = {
 
   async loadKeysJson() {
     const path = document.getElementById("cfg-keys-json").value.trim();
-    if (!path) { this.toast("请填写 all_keys.json 路径"); return; }
+    if (!path) { this.toast("请先选择 all_keys.json 文件"); return; }
     const el = document.getElementById("scan-result");
     el.textContent = "加载中..."; el.className = "result-hint";
     try {
@@ -292,6 +292,28 @@ const App = {
       await this.refreshStatus();
     } catch (e) {
       el.textContent = "失败: " + e.message; el.className = "result-hint err";
+    }
+  },
+
+  async pickKeysJson() {
+    // 调用后端 osascript 文件选择器，避免用户手动输入路径
+    const input = document.getElementById("cfg-keys-json");
+    this.toast("请在弹出的对话框中选择 all_keys.json", 4000);
+    try {
+      const r = await this.api("POST", "/api/pick_file", {
+        prompt: "选择 all_keys.json 文件",
+        file_type: "json",
+      });
+      if (r.path) {
+        input.value = r.path;
+        this.toast("已选择: " + r.path.split("/").pop());
+        // 选择后自动触发加载，减少用户操作步骤
+        await this.loadKeysJson();
+      } else {
+        this.toast("已取消选择");
+      }
+    } catch (e) {
+      this.toast("选择文件失败: " + e.message);
     }
   },
 

@@ -190,8 +190,12 @@ class WeChatKeyStore:
         格式：{"rel/path.db": {"enc_key": "64hex"}, ...}
         salt 从对应 .db 文件读取（与 wechat-decrypt 一致，更可靠）。
 
-        路径容错：Mac 微信检测可能返回 user_dir 而非 user_dir/db_storage，
-        若 db_storage_path/rel 找不到文件，自动尝试 db_storage_path/db_storage/rel。
+        路径容错（多层）：
+        1. 若 db_base 下无 .db 但 db_base/db_storage 有，自动修正 db_base
+        2. 若 db_base/rel 找不到，按 basename 在 db_base 下递归查找
+           （应对 wechat-decrypt 检测的 db_storage 根与本应用检测的不一致，
+            如本应用返回 .../Message 而 wechat-decrypt 用 .../db_storage）
+        3. 交叉验证 match_to_dbs() 按 salt 补全
         """
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         db_base = Path(db_storage_path)
@@ -202,21 +206,39 @@ class WeChatKeyStore:
                 db_base = sub
                 logger.info("[KeyStore] 自动修正 db_storage 路径: %s", db_base)
         store = cls(db_base)
+        # 预建 basename → 实际路径 索引，加速容错查找
+        basename_index: dict[str, Path] = {}
+        try:
+            for p in db_base.rglob("*.db"):
+                if not p.name.endswith(("-wal", "-shm", "-journal")):
+                    basename_index.setdefault(p.name, p)
+        except OSError:
+            pass
+
         for rel, info in data.items():
             if rel.startswith("_"):
                 continue  # 跳过元数据字段
             enc_key = info.get("enc_key") if isinstance(info, dict) else info
             if not enc_key or len(enc_key) != 64:
                 continue
+            # 1) 直接路径
             db_file = db_base / rel
             if not db_file.exists():
-                logger.debug("[KeyStore] all_keys.json 引用的 db 不存在: %s", rel)
-                continue
+                # 2) 按 basename 容错查找（路径结构不一致时）
+                basename = Path(rel).name
+                db_file = basename_index.get(basename)
+                if db_file is None:
+                    logger.debug("[KeyStore] all_keys.json 引用的 db 不存在: %s", rel)
+                    continue
+                logger.debug("[KeyStore] 路径容错：%s → %s", rel, db_file)
             try:
                 salt = db_file.read_bytes()[:SQLCIPHER_SALT_SIZE]
             except OSError:
                 continue
-            store.add_key(enc_key, salt.hex(), db_rel_path=rel)
+            # 用实际文件相对路径作为 db_rel_path（确保 get_key_for_db 能按 path 命中）
+            actual_rel = str(db_file.relative_to(db_base)).replace(os.sep, "/") \
+                if db_file.is_relative_to(db_base) else rel
+            store.add_key(enc_key, salt.hex(), db_rel_path=actual_rel)
         # 交叉验证补全未直接匹配的 db
         store.match_to_dbs()
         logger.info("[KeyStore] 从 %s 加载 %d 个密钥", path, len(store._by_salt))
@@ -416,7 +438,7 @@ def _scan_keys_macos_mach(pid: int) -> list[tuple[str, str]]:
         ]
 
     VM_REGION_BASIC_INFO_64 = 9
-    VM_REGION_BASIC_INFO_COUNT_64 = ctypes.sizeof(vm_region_basic_info_64) // 4
+    VM_REGION_BASIC_INFO_COUNT_64 = ctypes.sizeof(vm_region_basic_info_data_64) // 4
     VM_PROT_READ = 1
     VM_PROT_WRITE = 2
 
@@ -579,6 +601,159 @@ def scan_keys_macos(db_storage_path: str | Path) -> WeChatKeyStore:
 
 
 # ════════════════════════════════════════════════════════════════
+#  自包含扫描脚本生成器（打包后 sudo 执行，不依赖 src 包）
+# ════════════════════════════════════════════════════════════════
+def _build_self_contained_scan_script(db_storage_path: str) -> str:
+    """生成完全自包含的 Python 扫描脚本。
+
+    打包后通过 osascript sudo 执行 /usr/bin/python3，此时无 src 包可用，
+    脚本必须内联全部逻辑：PID 查找 + Mach VM 扫描 + HMAC 校验 + .db 匹配。
+
+    对齐 wechat-decrypt find_all_keys_macos.c + key_scan_common.py。
+    """
+    return f'''#!/usr/bin/env python3
+"""自包含微信密钥扫描脚本（由外贸助手生成，sudo 下独立运行）。"""
+import ctypes, ctypes.util, hashlib, hmac, json, os, re, struct, subprocess, sys
+
+DB_STORAGE = {repr(db_storage_path)}
+PAGE_SZ = 4096; SALT_SZ = 16; KEY_SZ = 32; IV_SZ = 16; HMAC_SZ = 64; RESERVE_SZ = 80
+MAX_KEYS = 256; CHUNK_SIZE = 2 * 1024 * 1024; OVERLAP = 101
+HEX_RE = re.compile(rb"x'([0-9a-fA-F]{{96}})'")
+
+def find_pid():
+    for name in ("微信", "WeChat"):
+        try:
+            r = subprocess.run(["pgrep", "-x", name], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and r.stdout.strip():
+                return int(r.stdout.strip().split("\\n")[0])
+        except Exception: pass
+    try:
+        r = subprocess.run(["pgrep", "-f", "xinWeChat"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return int(r.stdout.strip().split("\\n")[0])
+    except Exception: pass
+    return None
+
+def verify_enc_key(enc_key, db_page1):
+    if len(db_page1) < PAGE_SZ: return False
+    salt = db_page1[:SALT_SZ]
+    mac_salt = bytes(b ^ 0x3A for b in salt)
+    mac_key = hashlib.pbkdf2_hmac("sha512", enc_key, mac_salt, 2, dklen=KEY_SZ)
+    hmac_data = db_page1[SALT_SZ: PAGE_SZ - RESERVE_SZ + IV_SZ]
+    stored_hmac = db_page1[PAGE_SZ - HMAC_SZ: PAGE_SZ]
+    hm = hmac.new(mac_key, hmac_data, hashlib.sha512)
+    hm.update(struct.pack("<I", 1))
+    return hm.digest() == stored_hmac
+
+def scan_mach(pid):
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    mach_port_t = ctypes.c_uint; kern_return_t = ctypes.c_int
+    mach_vm_address_t = ctypes.c_uint64; mach_vm_size_t = ctypes.c_uint64
+    mach_msg_type_number_t = ctypes.c_uint32; natural_t = ctypes.c_uint
+    KERN_SUCCESS = 0
+
+    class vm_region_basic_info_data_64(ctypes.Structure):
+        _fields_ = [("protection", ctypes.c_int), ("max_protection", ctypes.c_int),
+            ("inheritance", ctypes.c_uint), ("shared", ctypes.c_uint), ("reserved", ctypes.c_uint),
+            ("offset", ctypes.c_uint64), ("behavior", ctypes.c_int), ("user_wired_count", ctypes.c_ushort)]
+
+    VM_REGION_BASIC_INFO_64 = 9
+    VM_REGION_BASIC_INFO_COUNT_64 = ctypes.sizeof(vm_region_basic_info_data_64) // 4
+    VM_PROT_READ = 1; VM_PROT_WRITE = 2
+
+    libc.task_for_pid.argtypes = [mach_port_t, ctypes.c_int, ctypes.POINTER(mach_port_t)]
+    libc.task_for_pid.restype = kern_return_t
+    libc.mach_vm_region.argtypes = [mach_port_t, ctypes.POINTER(mach_vm_address_t),
+        ctypes.POINTER(mach_vm_size_t), natural_t, ctypes.c_void_p, ctypes.POINTER(natural_t), ctypes.c_void_p]
+    libc.mach_vm_region.restype = kern_return_t
+    libc.mach_vm_read.argtypes = [mach_port_t, mach_vm_address_t, mach_vm_size_t,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(mach_msg_type_number_t)]
+    libc.mach_vm_read.restype = kern_return_t
+    libc.mach_vm_deallocate.argtypes = [mach_port_t, ctypes.c_void_p, mach_vm_size_t]
+    libc.mach_vm_deallocate.restype = kern_return_t
+
+    mach_self = ctypes.c_uint.in_dll(libc, "mach_task_self_").value
+    task = mach_port_t(0)
+    kr = libc.task_for_pid(mach_self, pid, ctypes.byref(task))
+    if kr != KERN_SUCCESS:
+        raise RuntimeError(f"task_for_pid 失败 (kern_return={{kr}})。需要 root 权限。")
+
+    keys = []; seen = set()
+    addr = mach_vm_address_t(0); size = mach_vm_size_t(0)
+    info = vm_region_basic_info_data_64(); count = natural_t(VM_REGION_BASIC_INFO_COUNT_64)
+    obj_name = mach_port_t(0)
+
+    while True:
+        kr = libc.mach_vm_region(task, ctypes.byref(addr), ctypes.byref(size),
+            VM_REGION_BASIC_INFO_64, ctypes.byref(info), ctypes.byref(count), ctypes.byref(obj_name))
+        if kr != KERN_SUCCESS: break
+        if size.value == 0: addr.value += 1; continue
+        if not (info.protection & VM_PROT_READ and info.protection & VM_PROT_WRITE):
+            addr.value += size.value; continue
+        region_end = addr.value + size.value; off = addr.value
+        while off < region_end:
+            chunk = min(CHUNK_SIZE, region_end - off)
+            data_ptr = ctypes.c_void_p(0); data_size = mach_msg_type_number_t(0)
+            kr = libc.mach_vm_read(task, off, chunk, ctypes.byref(data_ptr), ctypes.byref(data_size))
+            if kr != KERN_SUCCESS or not data_ptr.value or data_size.value == 0:
+                off += chunk; continue
+            try: buf = ctypes.string_at(data_ptr.value, data_size.value)
+            finally: libc.mach_vm_deallocate(mach_self, data_ptr, data_size.value)
+            for m in HEX_RE.finditer(buf):
+                h = m.group(1).decode("ascii").lower()
+                if h in seen: continue
+                seen.add(h)
+                keys.append((h[:64], h[64:96]))
+                if len(keys) >= MAX_KEYS: return keys
+            advance = chunk - OVERLAP if chunk > OVERLAP else chunk
+            off += advance
+        addr.value = region_end
+    return keys
+
+def match_to_dbs(keys, db_storage):
+    result = {{}}; db_base = os.path.expanduser(db_storage)
+    for root, dirs, files in os.walk(db_base):
+        for fn in files:
+            if not fn.endswith(".db") or fn.endswith(("-wal","-shm","-journal")): continue
+            fpath = os.path.join(root, fn)
+            try:
+                with open(fpath, "rb") as f: page1 = f.read(PAGE_SZ)
+            except Exception: continue
+            if len(page1) < PAGE_SZ or page1[:15] == b"SQLite format 3": continue
+            salt_hex = page1[:SALT_SZ].hex()
+            rel = os.path.relpath(fpath, db_base).replace(os.sep, "/")
+            for enc_key_hex, s_hex in keys:
+                if s_hex == salt_hex:
+                    result[rel] = {{"enc_key": enc_key_hex}}
+                    break
+            if rel not in result:
+                for enc_key_hex, s_hex in keys:
+                    if verify_enc_key(bytes.fromhex(enc_key_hex), page1):
+                        result[rel] = {{"enc_key": enc_key_hex}}
+                        break
+    return result
+
+def main():
+    pid = find_pid()
+    if pid is None:
+        print(json.dumps({{"ok": False, "error": "未找到微信进程，请确保微信已登录运行"}}))
+        sys.exit(1)
+    keys = scan_mach(pid)
+    if not keys:
+        print(json.dumps({{"ok": False, "error": "内存中未找到密钥。可能：1.需 sudo 2.微信4.1+内存扫描失效 3.微信刚启动未加载数据库"}}))
+        sys.exit(1)
+    matched = match_to_dbs(keys, DB_STORAGE)
+    print(json.dumps({{"ok": True, "total_keys": len(keys), "matched_dbs": len(matched), "keys": matched}}, ensure_ascii=False))
+
+try:
+    main()
+except Exception as e:
+    print(json.dumps({{"ok": False, "error": str(e)}}, ensure_ascii=False))
+    sys.exit(1)
+'''
+
+
+# ════════════════════════════════════════════════════════════════
 #  sudo 弹窗（osascript）—— GUI 用户无终端时的提权方案
 # ════════════════════════════════════════════════════════════════
 def scan_keys_macos_with_sudo_dialog(
@@ -599,31 +774,16 @@ def scan_keys_macos_with_sudo_dialog(
     """
     db_storage_path = str(Path(db_storage_path).resolve())
     # 打包模式下 sys.executable 是 .app 二进制（无法执行 .py），改用系统 Python；
-    # 扫描脚本只用 stdlib（ctypes/hashlib/hmac/struct/re），/usr/bin/python3 足够。
-    # 开发模式用 sys.executable（有完整依赖）。
+    # 扫描脚本只用 stdlib（ctypes/hashlib/hmac/struct/re/os/subprocess），
+    # /usr/bin/python3 足够，且不依赖 src 包（打包后无 src 目录）。
     if getattr(sys, "frozen", False):
         python_exe = "/usr/bin/python3"
     else:
         python_exe = sys.executable or "python3"
 
-    # 内联扫描脚本（独立运行，sudo 上下文）
-    scan_script = f'''
-import json, sys
-sys.path.insert(0, {repr(str(Path(__file__).resolve().parents[2]))})
-from src.wechat_parser.decryptor import scan_keys_macos
-import logging
-logging.basicConfig(level=logging.INFO, format="[scan] %(message)s", stream=sys.stderr)
-try:
-    store = scan_keys_macos({repr(db_storage_path)})
-    print(json.dumps({{
-        "ok": True,
-        "stats": store.stats(),
-        "keys": store.to_all_keys_json(),
-    }}, ensure_ascii=False))
-except Exception as e:
-    print(json.dumps({{"ok": False, "error": str(e)}}, ensure_ascii=False))
-    sys.exit(1)
-'''
+    # 完全自包含的扫描脚本（不 import src，打包后可独立运行）
+    # 包含：PID 查找 + Mach VM 扫描 + HMAC 校验 + .db 匹配
+    scan_script = _build_self_contained_scan_script(db_storage_path)
 
     # 写到临时文件
     with tempfile.NamedTemporaryFile(mode="w", suffix="_scan.py",
@@ -704,13 +864,15 @@ def get_key_store(
     Returns:
         匹配好 .db 的 WeChatKeyStore
     """
-    # 1) all_keys.json
+    # 1) all_keys.json（用户显式提供的密钥文件，最高优先级）
     if all_keys_json_path and Path(all_keys_json_path).exists():
         logger.info("[密钥] 加载 all_keys.json: %s", all_keys_json_path)
         store = WeChatKeyStore.load_all_keys_json(all_keys_json_path, db_storage_path)
-        if store.stats()["matched_dbs"] > 0:
+        stats = store.stats()
+        if stats["total_keys"] > 0:
+            logger.info("[密钥] all_keys.json 加载成功: %s", stats)
             return store
-        logger.warning("[密钥] all_keys.json 加载成功但未匹配到 .db，尝试其他方式")
+        logger.warning("[密钥] all_keys.json 加载成功但密钥数为 0，尝试其他方式")
 
     # 2) 手动 raw_key
     if manual_raw_key and len(manual_raw_key.strip()) == 96:
