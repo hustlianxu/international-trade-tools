@@ -47,6 +47,30 @@ _CHUNK_SIZE = 2 * 1024 * 1024  # 2MB
 _HEX_PATTERN_LEN = 96  # 64 hex key + 32 hex salt
 
 
+def _verify_enc_key(enc_key: bytes, db_page1: bytes) -> bool:
+    """通过 HMAC-SHA512 校验 page 1 验证 enc_key 是否正确。
+
+    严格对齐 wechat-decrypt key_scan_common.py::verify_enc_key：
+        salt = page1[:16]
+        mac_salt = salt 各字节 xor 0x3A
+        mac_key = PBKDF2-HMAC-SHA512(enc_key, mac_salt, 2, dklen=32)
+        hmac_data = page1[16 : 4032]   # = encrypted + IV
+        stored_hmac = page1[4032 : 4096]
+        expected = HMAC-SHA512(mac_key, hmac_data + page_num(小端, =1))
+    """
+    if len(db_page1) < SQLCIPHER_PAGE_SIZE:
+        return False
+    salt = db_page1[:SQLCIPHER_SALT_SIZE]
+    mac_salt = bytes(b ^ 0x3A for b in salt)
+    mac_key = hashlib.pbkdf2_hmac(SQLCIPHER_HMAC_ALGO, enc_key, mac_salt, 2, dklen=32)
+    # page1[16:4032] = encrypted[4000] + IV[16]，注意 4032 = 4096 - 80 + 16
+    hmac_data = db_page1[SQLCIPHER_SALT_SIZE: SQLCIPHER_PAGE_SIZE - SQLCIPHER_RESERVED + 16]
+    stored_hmac = db_page1[SQLCIPHER_PAGE_SIZE - 64: SQLCIPHER_PAGE_SIZE]
+    hm = hmac.new(mac_key, hmac_data, hashlib.sha512)
+    hm.update(struct.pack("<I", 1))  # page_num 小端
+    return hm.digest() == stored_hmac
+
+
 # ════════════════════════════════════════════════════════════════
 #  密钥存储
 # ════════════════════════════════════════════════════════════════
@@ -187,21 +211,19 @@ class WeChatKeyStore:
     def load_all_keys_json(cls, path: str | Path, db_storage_path: str | Path) -> "WeChatKeyStore":
         """加载 wechat-decrypt 产出的 all_keys.json。
 
-        wechat-decrypt 的 all_keys.json 格式：
-            {
-              "message/message_0.db": {"enc_key": "64hex", "salt": "32hex", "size_mb": 1.2},
-              "session/session.db": {"enc_key": "64hex", "salt": "32hex", "size_mb": 0.5},
-              "_db_dir": "/original/db_dir/path"
-            }
+        wechat-decrypt 有两种 all_keys.json 格式：
+        1. Mac C 扫描器（find_all_keys_macos.c）：{"rel/path.db": {"enc_key": "64hex"}}
+           ⚠️ 无 salt 字段，必须从 .db 文件读取
+        2. Python 扫描器（key_scan_common.py）：{"rel/path.db": {"enc_key": "64hex", "salt": "32hex"}}
+           含 salt 字段
 
-        ⚠️ salt 直接从 JSON 读取（wechat-decrypt 已包含），无需 .db 文件存在。
-        之前的实现强制读 .db 文件取 salt，路径不匹配时 → 0 密钥 → 回退 auto_scan → 失败。
-
-        路径匹配策略（按优先级）：
-        1. 若 JSON 有 _db_dir 元数据，优先用其作为 db_base（wechat-decrypt 的原始路径）
-        2. 若 db_base/rel 直接存在，用之
-        3. 按 basename 在 db_base 下递归查找（路径结构不一致时）
-        4. 若 .db 文件不存在，仅靠 JSON 中的 salt 也能建立密钥条目（解密时再找文件）
+        匹配策略（对齐 key_scan_common.py，不依赖路径完全匹配）：
+        1. 收集 db_storage 下所有 .db 文件及其 salt（page1 前 16 字节）
+        2. 对 JSON 中每个 enc_key：
+           a. 若 JSON 含 salt，直接按 salt 匹配 .db
+           b. 若 JSON 无 salt，用 HMAC 验证（verify_enc_key）逐个尝试 .db
+              —— 这是最可靠的方式，与 wechat-decrypt 内存扫描时一致
+        3. 交叉验证补全
         """
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         db_base = Path(db_storage_path)
@@ -212,9 +234,9 @@ class WeChatKeyStore:
             db_base = Path(json_db_dir)
             logger.info("[KeyStore] 使用 all_keys.json 中的 _db_dir: %s", db_base)
 
-        # 自动探测：若 db_base 下无 .db 但 db_base/db_storage 有，则修正
+        # 自动探测：若 db_base 下无 .db 但子目录有，则修正
         if not any(db_base.rglob("*.db")):
-            for sub_name in ("db_storage", "Message"):
+            for sub_name in ("db_storage", "Message", "message"):
                 sub = db_base / sub_name
                 if sub.exists() and any(sub.rglob("*.db")):
                     db_base = sub
@@ -222,61 +244,120 @@ class WeChatKeyStore:
                     break
 
         store = cls(db_base)
-        # 预建 basename → 实际路径 索引，加速容错查找
-        basename_index: dict[str, Path] = {}
-        try:
-            for p in db_base.rglob("*.db"):
-                if not p.name.endswith(("-wal", "-shm", "-journal")):
-                    basename_index.setdefault(p.name, p)
-        except OSError:
-            pass
 
-        loaded = 0
+        # 收集所有 .db 文件：basename → [(abs_path, salt_hex, page1), ...]
+        db_index: list[tuple[Path, str, bytes]] = []
+        try:
+            for p in sorted(db_base.rglob("*.db")):
+                if p.name.endswith(("-wal", "-shm", "-journal")):
+                    continue
+                try:
+                    page1 = p.read_bytes()[:SQLCIPHER_PAGE_SIZE]
+                except OSError:
+                    continue
+                if len(page1) < SQLCIPHER_PAGE_SIZE:
+                    continue
+                # 跳过已解密的 SQLite 文件
+                if page1[:15] == b"SQLite format 3":
+                    continue
+                salt_hex = page1[:SQLCIPHER_SALT_SIZE].hex()
+                db_index.append((p, salt_hex, page1))
+        except OSError as e:
+            logger.warning("[KeyStore] 遍历 db_storage 失败: %s", e)
+
+        logger.info("[KeyStore] db_storage=%s, 找到 %d 个加密 .db 文件",
+                    db_base, len(db_index))
+
+        # 提取 JSON 中的密钥列表
+        enc_keys: list[tuple[str, str]] = []  # [(rel_path, enc_key_hex), ...]
+        json_salts: dict[str, str] = {}  # enc_key_hex → salt_hex（若 JSON 含 salt）
         for rel, info in data.items():
             if rel.startswith("_"):
-                continue  # 跳过元数据字段（_db_dir 等）
-            if not isinstance(info, dict):
                 continue
-            enc_key = info.get("enc_key")
+            if isinstance(info, dict):
+                enc_key = info.get("enc_key")
+                salt = info.get("salt", "")
+            else:
+                enc_key = info
+                salt = ""
             if not enc_key or len(enc_key) != 64:
                 continue
+            enc_keys.append((rel, enc_key))
+            if salt and len(salt) == 32:
+                json_salts[enc_key.lower()] = salt.lower()
 
-            # ⚠️ salt 优先从 JSON 读取（wechat-decrypt 已包含），无需 .db 文件
-            salt_hex = info.get("salt", "")
-            db_rel_path = rel  # 默认用 JSON 中的相对路径
+        logger.info("[KeyStore] all_keys.json 含 %d 个密钥（其中 %d 个含 salt）",
+                    len(enc_keys), len(json_salts))
 
-            if not salt_hex or len(salt_hex) != 32:
-                # JSON 无 salt，从 .db 文件读取（回退方案）
+        # 匹配密钥到 .db 文件
+        loaded = 0
+        for rel, enc_key_hex in enc_keys:
+            enc_key = bytes.fromhex(enc_key_hex)
+            matched_db: Path | None = None
+            matched_salt: str = ""
+
+            # 策略1：JSON 含 salt，按 salt 精确匹配
+            json_salt = json_salts.get(enc_key_hex.lower())
+            if json_salt:
+                for db_path, salt_hex, page1 in db_index:
+                    if salt_hex == json_salt:
+                        matched_db = db_path
+                        matched_salt = salt_hex
+                        break
+
+            # 策略2：按相对路径/basename 匹配后读 salt
+            if matched_db is None:
                 db_file = db_base / rel
                 if not db_file.exists():
                     basename = Path(rel).name
-                    db_file = basename_index.get(basename)
-                if db_file and db_file.exists():
-                    try:
-                        salt_hex = db_file.read_bytes()[:SQLCIPHER_SALT_SIZE].hex()
-                    except OSError:
-                        continue
+                    for db_path, salt_hex, page1 in db_index:
+                        if db_path.name == basename:
+                            matched_db = db_path
+                            matched_salt = salt_hex
+                            break
                 else:
-                    logger.debug("[KeyStore] 无法获取 salt（JSON 无 + .db 不存在）: %s", rel)
-                    continue
-            else:
-                # JSON 有 salt，尝试匹配 .db 文件路径（用于后续 get_key_for_db 按路径查找）
-                db_file = db_base / rel
-                if not db_file.exists():
-                    basename = Path(rel).name
-                    db_file = basename_index.get(basename)
-                if db_file and db_file.exists() and db_file.is_relative_to(db_base):
-                    db_rel_path = str(db_file.relative_to(db_base)).replace(os.sep, "/")
+                    for db_path, salt_hex, page1 in db_index:
+                        if db_path == db_file:
+                            matched_db = db_path
+                            matched_salt = salt_hex
+                            break
+
+            # 策略3：HMAC 验证（最可靠，对齐 key_scan_common.py verify_enc_key）
+            # 逐个 .db 尝试，enc_key + .db 的 salt → 验证 page1 HMAC
+            if matched_db is None:
+                for db_path, salt_hex, page1 in db_index:
+                    if _verify_enc_key(enc_key, page1):
+                        matched_db = db_path
+                        matched_salt = salt_hex
+                        logger.debug("[KeyStore] HMAC 验证匹配: %s", db_path.name)
+                        break
+
+            if matched_db is None:
+                logger.debug("[KeyStore] 密钥 %s 未匹配到任何 .db", rel)
+                # 即使没匹配到 .db，若 JSON 含 salt 也保留密钥（解密时再找文件）
+                if json_salt:
+                    try:
+                        store.add_key(enc_key_hex, json_salt, db_rel_path=rel)
+                        loaded += 1
+                    except ValueError:
+                        pass
+                continue
+
+            # 计算实际相对路径
+            try:
+                actual_rel = str(matched_db.relative_to(db_base)).replace(os.sep, "/")
+            except ValueError:
+                actual_rel = rel
 
             try:
-                store.add_key(enc_key, salt_hex, db_rel_path=db_rel_path)
+                store.add_key(enc_key_hex, matched_salt, db_rel_path=actual_rel)
                 loaded += 1
             except ValueError as e:
                 logger.debug("[KeyStore] 跳过无效密钥 %s: %s", rel, e)
 
-        # 交叉验证补全未直接匹配的 db
         store.match_to_dbs()
-        logger.info("[KeyStore] 从 %s 加载 %d 个密钥", path, loaded)
+        logger.info("[KeyStore] 从 %s 加载 %d 个密钥（匹配 %d 个 .db）",
+                    path, loaded, len(store._by_path))
         return store
 
     # ─── 内部 ───

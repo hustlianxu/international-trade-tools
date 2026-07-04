@@ -410,6 +410,8 @@ def make_handler(backend: WebBackend):
                 self._ok(backend.config)
             elif path == "/api/todos":
                 self._ok(backend.list_todos())
+            elif path == "/api/keys/diagnose":
+                self._ok(backend.diagnose_keys())
             elif path.startswith("/api/chats/"):
                 talker = path[len("/api/chats/"):]
                 self._ok(backend.get_chat_history(
