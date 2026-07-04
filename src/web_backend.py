@@ -194,6 +194,81 @@ class WebBackend:
         self.reset_components()
         return {"ok": True}
 
+    def diagnose_keys(self) -> dict:
+        """诊断密钥加载问题：返回 db_storage 中的 .db 文件列表 + all_keys.json 内容摘要。
+
+        用于排查"密钥总数: 0"等问题的根因。
+        """
+        import json as _json
+        from pathlib import Path as _Path
+        wechat_cfg = self.config.get("wechat", {})
+        db_path = wechat_cfg.get("db_storage_path", "")
+        keys_path = wechat_cfg.get("all_keys_json_path", "")
+        result = {
+            "db_storage_path": db_path,
+            "db_storage_exists": bool(db_path) and _Path(db_path).exists(),
+            "db_files": [],
+            "all_keys_json_path": keys_path,
+            "all_keys_json_exists": bool(keys_path) and _Path(keys_path).exists(),
+            "all_keys_json_entries": [],
+            "all_keys_json_db_dir": "",
+            "issues": [],
+        }
+        # 列出 db_storage 下的 .db 文件
+        if db_path and _Path(db_path).exists():
+            try:
+                for p in sorted(_Path(db_path).rglob("*.db")):
+                    if p.name.endswith(("-wal", "-shm", "-journal")):
+                        continue
+                    try:
+                        size = p.stat().st_size
+                        salt_hex = p.read_bytes()[:16].hex()
+                    except OSError:
+                        size, salt_hex = 0, ""
+                    result["db_files"].append({
+                        "rel": str(p.relative_to(db_path)).replace("\\", "/"),
+                        "basename": p.name,
+                        "size_mb": round(size / 1024 / 1024, 2),
+                        "salt": salt_hex,
+                    })
+            except OSError as e:
+                result["issues"].append(f"遍历 db_storage 失败: {e}")
+        else:
+            result["issues"].append(f"db_storage 路径不存在: {db_path}")
+        # 解析 all_keys.json
+        if keys_path and _Path(keys_path).exists():
+            try:
+                data = _json.loads(_Path(keys_path).read_text(encoding="utf-8"))
+                result["all_keys_json_db_dir"] = data.get("_db_dir", "")
+                for k, v in data.items():
+                    if k.startswith("_"):
+                        continue
+                    if isinstance(v, dict):
+                        result["all_keys_json_entries"].append({
+                            "key": k,
+                            "enc_key_len": len(v.get("enc_key", "")),
+                            "has_salt": "salt" in v and len(v.get("salt", "")) == 32,
+                            "salt": v.get("salt", "")[:16] + "…" if v.get("salt") else "",
+                        })
+                    else:
+                        result["all_keys_json_entries"].append({"key": k, "raw": str(v)[:50]})
+            except (_json.JSONDecodeError, OSError) as e:
+                result["issues"].append(f"解析 all_keys.json 失败: {e}")
+        else:
+            result["issues"].append(f"all_keys.json 不存在: {keys_path}")
+        # 交叉匹配检查
+        if result["db_files"] and result["all_keys_json_entries"]:
+            db_basenames = {f["basename"] for f in result["db_files"]}
+            json_basenames = {_Path(e["key"]).name for e in result["all_keys_json_entries"]}
+            matched = db_basenames & json_basenames
+            result["basename_matches"] = len(matched)
+            if not matched:
+                result["issues"].append(
+                    "⚠️ db_storage 中的 .db 文件名与 all_keys.json 中的 key 无任何 basename 匹配——"
+                    "可能是 wechat-decrypt 检测的 db_dir 与本应用检测的 db_storage_path 不一致"
+                )
+        return result
+
     def pick_file(self, prompt: str = "选择文件", file_type: str = "json") -> dict:
         """弹出系统原生文件选择对话框，返回选中文件路径。
 
@@ -370,6 +445,8 @@ def make_handler(backend: WebBackend):
                 self._ok(backend.load_keys_json(body.get("path", "")))
             elif path == "/api/keys/raw":
                 self._ok(backend.set_raw_key(body.get("raw_key", "")))
+            elif path == "/api/keys/diagnose":
+                self._ok(backend.diagnose_keys())
             elif path == "/api/pick_file":
                 self._ok(backend.pick_file(
                     prompt=body.get("prompt", "选择文件"),

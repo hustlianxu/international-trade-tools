@@ -187,24 +187,40 @@ class WeChatKeyStore:
     def load_all_keys_json(cls, path: str | Path, db_storage_path: str | Path) -> "WeChatKeyStore":
         """加载 wechat-decrypt 产出的 all_keys.json。
 
-        格式：{"rel/path.db": {"enc_key": "64hex"}, ...}
-        salt 从对应 .db 文件读取（与 wechat-decrypt 一致，更可靠）。
+        wechat-decrypt 的 all_keys.json 格式：
+            {
+              "message/message_0.db": {"enc_key": "64hex", "salt": "32hex", "size_mb": 1.2},
+              "session/session.db": {"enc_key": "64hex", "salt": "32hex", "size_mb": 0.5},
+              "_db_dir": "/original/db_dir/path"
+            }
 
-        路径容错（多层）：
-        1. 若 db_base 下无 .db 但 db_base/db_storage 有，自动修正 db_base
-        2. 若 db_base/rel 找不到，按 basename 在 db_base 下递归查找
-           （应对 wechat-decrypt 检测的 db_storage 根与本应用检测的不一致，
-            如本应用返回 .../Message 而 wechat-decrypt 用 .../db_storage）
-        3. 交叉验证 match_to_dbs() 按 salt 补全
+        ⚠️ salt 直接从 JSON 读取（wechat-decrypt 已包含），无需 .db 文件存在。
+        之前的实现强制读 .db 文件取 salt，路径不匹配时 → 0 密钥 → 回退 auto_scan → 失败。
+
+        路径匹配策略（按优先级）：
+        1. 若 JSON 有 _db_dir 元数据，优先用其作为 db_base（wechat-decrypt 的原始路径）
+        2. 若 db_base/rel 直接存在，用之
+        3. 按 basename 在 db_base 下递归查找（路径结构不一致时）
+        4. 若 .db 文件不存在，仅靠 JSON 中的 salt 也能建立密钥条目（解密时再找文件）
         """
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         db_base = Path(db_storage_path)
-        # 自动探测真实 db_storage 根：若 db_base 下无 .db 但 db_base/db_storage 有，则用后者
+
+        # wechat-decrypt 在 JSON 中保存了原始 db_dir，优先使用（最可靠）
+        json_db_dir = data.get("_db_dir")
+        if json_db_dir and Path(json_db_dir).exists():
+            db_base = Path(json_db_dir)
+            logger.info("[KeyStore] 使用 all_keys.json 中的 _db_dir: %s", db_base)
+
+        # 自动探测：若 db_base 下无 .db 但 db_base/db_storage 有，则修正
         if not any(db_base.rglob("*.db")):
-            sub = db_base / "db_storage"
-            if sub.exists() and any(sub.rglob("*.db")):
-                db_base = sub
-                logger.info("[KeyStore] 自动修正 db_storage 路径: %s", db_base)
+            for sub_name in ("db_storage", "Message"):
+                sub = db_base / sub_name
+                if sub.exists() and any(sub.rglob("*.db")):
+                    db_base = sub
+                    logger.info("[KeyStore] 自动修正 db_storage 路径: %s", db_base)
+                    break
+
         store = cls(db_base)
         # 预建 basename → 实际路径 索引，加速容错查找
         basename_index: dict[str, Path] = {}
@@ -215,33 +231,52 @@ class WeChatKeyStore:
         except OSError:
             pass
 
+        loaded = 0
         for rel, info in data.items():
             if rel.startswith("_"):
-                continue  # 跳过元数据字段
-            enc_key = info.get("enc_key") if isinstance(info, dict) else info
+                continue  # 跳过元数据字段（_db_dir 等）
+            if not isinstance(info, dict):
+                continue
+            enc_key = info.get("enc_key")
             if not enc_key or len(enc_key) != 64:
                 continue
-            # 1) 直接路径
-            db_file = db_base / rel
-            if not db_file.exists():
-                # 2) 按 basename 容错查找（路径结构不一致时）
-                basename = Path(rel).name
-                db_file = basename_index.get(basename)
-                if db_file is None:
-                    logger.debug("[KeyStore] all_keys.json 引用的 db 不存在: %s", rel)
+
+            # ⚠️ salt 优先从 JSON 读取（wechat-decrypt 已包含），无需 .db 文件
+            salt_hex = info.get("salt", "")
+            db_rel_path = rel  # 默认用 JSON 中的相对路径
+
+            if not salt_hex or len(salt_hex) != 32:
+                # JSON 无 salt，从 .db 文件读取（回退方案）
+                db_file = db_base / rel
+                if not db_file.exists():
+                    basename = Path(rel).name
+                    db_file = basename_index.get(basename)
+                if db_file and db_file.exists():
+                    try:
+                        salt_hex = db_file.read_bytes()[:SQLCIPHER_SALT_SIZE].hex()
+                    except OSError:
+                        continue
+                else:
+                    logger.debug("[KeyStore] 无法获取 salt（JSON 无 + .db 不存在）: %s", rel)
                     continue
-                logger.debug("[KeyStore] 路径容错：%s → %s", rel, db_file)
+            else:
+                # JSON 有 salt，尝试匹配 .db 文件路径（用于后续 get_key_for_db 按路径查找）
+                db_file = db_base / rel
+                if not db_file.exists():
+                    basename = Path(rel).name
+                    db_file = basename_index.get(basename)
+                if db_file and db_file.exists() and db_file.is_relative_to(db_base):
+                    db_rel_path = str(db_file.relative_to(db_base)).replace(os.sep, "/")
+
             try:
-                salt = db_file.read_bytes()[:SQLCIPHER_SALT_SIZE]
-            except OSError:
-                continue
-            # 用实际文件相对路径作为 db_rel_path（确保 get_key_for_db 能按 path 命中）
-            actual_rel = str(db_file.relative_to(db_base)).replace(os.sep, "/") \
-                if db_file.is_relative_to(db_base) else rel
-            store.add_key(enc_key, salt.hex(), db_rel_path=actual_rel)
+                store.add_key(enc_key, salt_hex, db_rel_path=db_rel_path)
+                loaded += 1
+            except ValueError as e:
+                logger.debug("[KeyStore] 跳过无效密钥 %s: %s", rel, e)
+
         # 交叉验证补全未直接匹配的 db
         store.match_to_dbs()
-        logger.info("[KeyStore] 从 %s 加载 %d 个密钥", path, len(store._by_salt))
+        logger.info("[KeyStore] 从 %s 加载 %d 个密钥", path, loaded)
         return store
 
     # ─── 内部 ───
@@ -312,54 +347,79 @@ class WeChatDecryptor:
         return cls(entry.enc_key, salt)
 
     def _decrypt_page(self, page_data: bytes, page_num: int) -> bytes:
-        """解密单个数据库页（4096 字节）。"""
+        """解密单个数据库页，输出 4096 字节标准 SQLite 页面。
+
+        严格对齐 wechat-decrypt decrypt_db.py::decrypt_page：
+        - 页结构: [加密数据][IV(16)][HMAC(64)]，reserve=80
+        - 首页跳过前 16 字节 salt
+        - HMAC = SHA512(mac_key, encrypted + IV + page_num_LE)
+          ⚠️ 必须包含 IV，page_num 必须小端序（之前用大端 + 漏 IV 导致全失败）
+        - 首页输出: SQLITE_HDR + decrypted + zeros(80) = 4096
+        - 其他页输出: decrypted + zeros(80) = 4096
+        """
         from Crypto.Cipher import AES
 
-        # 页结构: [加密数据][IV(16)][HMAC(64)]
-        # 首页跳过前 16 字节 salt
-        offset = SQLCIPHER_SALT_SIZE if page_num == 1 else 0
-        encrypted = page_data[offset: SQLCIPHER_PAGE_SIZE - SQLCIPHER_RESERVED]
+        IV_SZ = 16
         iv = page_data[SQLCIPHER_PAGE_SIZE - SQLCIPHER_RESERVED:
-                       SQLCIPHER_PAGE_SIZE - SQLCIPHER_RESERVED + 16]
-        hmac_val = page_data[SQLCIPHER_PAGE_SIZE - SQLCIPHER_RESERVED + 16:
-                             SQLCIPHER_PAGE_SIZE]
-
-        # HMAC 校验（页号大端 1 字节 + 加密数据）
-        hmac_data = encrypted + struct.pack(">I", page_num)
-        expected_hmac = hmac.new(self.hmac_key, hmac_data, hashlib.sha512).digest()
-        if not hmac.compare_digest(expected_hmac, hmac_val):
-            raise ValueError(f"页 {page_num} HMAC 校验失败，密钥可能错误")
-
-        cipher = AES.new(self.enc_key, AES.MODE_CBC, iv)
-        decrypted = cipher.decrypt(encrypted)
+                       SQLCIPHER_PAGE_SIZE - SQLCIPHER_RESERVED + IV_SZ]
 
         if page_num == 1:
-            # 用 SQLite 头填充原 salt 位置
-            decrypted = SQLITE_HEADER + decrypted[len(SQLITE_HEADER):]
+            # 首页：跳过 salt，加密区是 [16 : 4016]
+            encrypted = page_data[SQLCIPHER_SALT_SIZE:
+                                  SQLCIPHER_PAGE_SIZE - SQLCIPHER_RESERVED]
+            # HMAC 校验：encrypted + IV + page_num(小端)
+            # 对齐 wechat-decrypt: p1_hmac_data = page1[16 : 4032] = encrypted + IV
+            hmac_data = encrypted + iv + struct.pack("<I", page_num)
+            expected_hmac = hmac.new(self.hmac_key, hmac_data, hashlib.sha512).digest()
+            stored_hmac = page_data[SQLCIPHER_PAGE_SIZE - 64: SQLCIPHER_PAGE_SIZE]
+            if not hmac.compare_digest(expected_hmac, stored_hmac):
+                raise ValueError(f"页 {page_num} HMAC 校验失败，密钥可能错误")
 
-        padding_needed = SQLCIPHER_PAGE_SIZE - len(decrypted) - SQLCIPHER_RESERVED
-        if padding_needed > 0:
-            decrypted += b"\x00" * padding_needed
-        return decrypted
+            cipher = AES.new(self.enc_key, AES.MODE_CBC, iv)
+            decrypted = cipher.decrypt(encrypted)
+            # 首页：SQLite 头 + 解密数据 + reserve 填零 = 4096
+            return SQLITE_HEADER + decrypted + b"\x00" * SQLCIPHER_RESERVED
+        else:
+            # 其他页：加密区是 [0 : 4016]
+            encrypted = page_data[: SQLCIPHER_PAGE_SIZE - SQLCIPHER_RESERVED]
+            hmac_data = encrypted + iv + struct.pack("<I", page_num)
+            expected_hmac = hmac.new(self.hmac_key, hmac_data, hashlib.sha512).digest()
+            stored_hmac = page_data[SQLCIPHER_PAGE_SIZE - 64: SQLCIPHER_PAGE_SIZE]
+            if not hmac.compare_digest(expected_hmac, stored_hmac):
+                raise ValueError(f"页 {page_num} HMAC 校验失败，密钥可能错误")
+
+            cipher = AES.new(self.enc_key, AES.MODE_CBC, iv)
+            decrypted = cipher.decrypt(encrypted)
+            # 其他页：解密数据 + reserve 填零 = 4096
+            return decrypted + b"\x00" * SQLCIPHER_RESERVED
 
     def decrypt_db(self, db_path: str | Path, output_path: str | Path = None) -> str:
-        """解密整个 .db 文件为明文 SQLite。"""
+        """解密整个 .db 文件为明文 SQLite。
+
+        对齐 wechat-decrypt decrypt_db.py::decrypt_database：
+        - file_size // PAGE_SZ 计算总页数（不是减 salt 再除）
+        - 逐页读取 4096 字节，不足补零
+        """
         db_path = Path(db_path)
         if output_path is None:
             output_path = Path(tempfile.gettempdir()) / f"dec_{db_path.name}"
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        raw = db_path.read_bytes()
-        total_pages = (len(raw) - SQLCIPHER_SALT_SIZE) // SQLCIPHER_PAGE_SIZE + 1
+        file_size = db_path.stat().st_size
+        total_pages = file_size // SQLCIPHER_PAGE_SIZE
+        if file_size % SQLCIPHER_PAGE_SIZE != 0:
+            total_pages += 1
 
-        with open(output_path, "wb") as f:
+        with open(db_path, "rb") as fin, open(output_path, "wb") as fout:
             for page_num in range(1, total_pages + 1):
-                start = (page_num - 1) * SQLCIPHER_PAGE_SIZE
-                page_data = raw[start: start + SQLCIPHER_PAGE_SIZE]
+                page_data = fin.read(SQLCIPHER_PAGE_SIZE)
                 if len(page_data) < SQLCIPHER_PAGE_SIZE:
-                    page_data += b"\x00" * (SQLCIPHER_PAGE_SIZE - len(page_data))
-                f.write(self._decrypt_page(page_data, page_num))
+                    if len(page_data) > 0:
+                        page_data += b"\x00" * (SQLCIPHER_PAGE_SIZE - len(page_data))
+                    else:
+                        break
+                fout.write(self._decrypt_page(page_data, page_num))
 
         # 清理验证残留的 -wal/-shm
         for suffix in ("-wal", "-shm"):
@@ -863,6 +923,9 @@ def get_key_store(
 
     Returns:
         匹配好 .db 的 WeChatKeyStore
+
+    ⚠️ 若用户显式提供了 all_keys.json 或 raw_key，即使密钥数为 0 也直接返回/报错，
+    不回退到 auto_scan（避免无 sudo 权限时触发 task_for_pid 失败）。
     """
     # 1) all_keys.json（用户显式提供的密钥文件，最高优先级）
     if all_keys_json_path and Path(all_keys_json_path).exists():
@@ -872,7 +935,14 @@ def get_key_store(
         if stats["total_keys"] > 0:
             logger.info("[密钥] all_keys.json 加载成功: %s", stats)
             return store
-        logger.warning("[密钥] all_keys.json 加载成功但密钥数为 0，尝试其他方式")
+        # all_keys.json 加载 0 密钥 — 不回退 auto_scan，直接报错（用户已显式指定文件）
+        raise RuntimeError(
+            f"all_keys.json 加载了 0 个密钥。请检查：\n"
+            f"  1. 文件内容是否正确（应由 wechat-decrypt 工具生成）\n"
+            f"  2. 文件路径：{all_keys_json_path}\n"
+            f"  3. db_storage 路径：{db_storage_path}\n"
+            f"建议重新运行 wechat-decrypt 工具生成新的 all_keys.json"
+        )
 
     # 2) 手动 raw_key
     if manual_raw_key and len(manual_raw_key.strip()) == 96:
@@ -882,11 +952,20 @@ def get_key_store(
         matched = store.match_to_dbs()
         if matched > 0:
             return store
-        logger.warning("[密钥] 手动 key 未匹配到任何 .db")
+        # raw_key 未匹配到 .db — 不回退 auto_scan，直接报错
+        raise RuntimeError(
+            f"手动 raw_key 未匹配到任何 .db 文件。\n"
+            f"请确认 db_storage 路径正确：{db_storage_path}\n"
+            f"或检查 raw_key 是否正确（96 字符 hex）"
+        )
 
-    # 3) 自动扫描
+    # 3) 自动扫描（仅当未提供 all_keys.json 和 raw_key 时）
     if not auto_scan:
-        raise RuntimeError("无可用密钥源（all_keys.json / 手动 key / 自动扫描均未启用）")
+        raise RuntimeError(
+            "无可用密钥源。请在「设置」中：\n"
+            "  1. 加载 all_keys.json（用 wechat-decrypt 工具生成，推荐）\n"
+            "  2. 或手动输入密钥（96 字符 hex）"
+        )
 
     if sys.platform == "darwin":
         if use_sudo_dialog:
